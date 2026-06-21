@@ -1,0 +1,5 @@
+linux/server
+linux/client
+*.o
+*.out
+.vscode/
