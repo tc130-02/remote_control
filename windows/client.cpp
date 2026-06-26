@@ -1,448 +1,969 @@
-﻿#include <stdio.h>
-#include <Windows.h>
-#include <atlimage.h>
+﻿#define _WINSOCK_DEPRECATED_NO_WARNINGS
+#define _CRT_SECURE_NO_WARNINGS
+#define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
 
-#pragma comment(lib,"ws2_32.lib")
-#pragma pack(push,1)
-struct PacketHeader
-{
-	int magic;//4字节包头
-	int cmd;//4字节命令号
-	int body_len;//数据长度
-};
+#include <winsock2.h>
+#include <windows.h>
+#include <iostream>
+#include <cstring>
+#include <string>
+#include <cstdio>
+#include <cstdlib>
+#include <vector>
+#include <thread>
+#include <mutex>
+#include <atomic>
 
-#pragma pack(pop)
-struct Packet
-{
-	PacketHeader header;//包头
-	char body[];//包数据，不固定
-};
+#pragma comment(lib, "ws2_32.lib")
 
-struct KEYBOARD
-{
-	int vitrual_code;//虚拟码
-	int key_status;//按下0/放开1
-};
+#include "../common/packet.h"
 
-enum CMD//枚举就是方便定义整数常量的
-{
-	CMD_SCREEN = 1,
-	CMD_MOUSE = 2,
-	CMD_KEYBOARD = 4,
-	CMD_TESTCONNECT = 2026
-};
-
-enum ENUM_MOUSE
-{
-	MOUSE_MOVE = 1,//鼠标移动
-	MOUSE_LDOWN = 2,//鼠标左键按下
-	MOUSE_LUP = 3,//鼠标左键抬起
-	MOUSE_RDOWN = 4,//鼠标右键按下
-	MOUSE_RUP = 5,//鼠标右键抬起
-	MOUSE_MDOWN = 6,//鼠标中间按下
-	MOUSE_MUP = 7,//鼠标中间抬起
-	MOUSE_LCLICK = 8, //鼠标左键双击
-	MOUSE_RCLICK = 9,//鼠标右键双击
-	MOUSE_MCLICK = 10,//鼠标中键双击
-	MOUSE_LDCLICK = 11,//鼠标左键双击
-	MOUSE_RDCLICK = 12,//鼠标右键双击
-	MOUSE_MDCLICK = 13//鼠标中间双击
-};
-struct MOUSE
-{
-	int action;//鼠标行为
-	POINT	ptXY;//鼠标的坐标x，y
-};
-
-int GetPacketLen(Packet* pck)
-{
-	if (pck != NULL) {
-		return pck->header.body_len + sizeof(PacketHeader);
-	}
-}
-Packet* PackPacket(int cmd, char* buffer, int buffer_len);
-Packet* ParsePacket(char* buffer, int len);
-int InitWindow(HINSTANCE hInstance, int nCmdShow);
-int InitSocket();
-DWORD WINAPI SendScreenCallBack(LPVOID lpThreadParameter);
-SOCKET g_server_socket;
-SOCKADDR_IN g_server_addr;
+SOCKET g_server_socket = INVALID_SOCKET;
+SOCKADDR_IN g_server_addr = {};
 HWND g_hwnd = NULL;
-CImage g_image;
-#define RECV_BUFFER_LEN 1024 * 1024 * 10
 
-CRITICAL_SECTION g_cri_sec;
-int g_remote_width = -1;
-int g_remote_height = -1;
+int g_remote_width = 1918;
+int g_remote_height = 918;
 
-LRESULT CALLBACK winProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
-	switch (msg)
-	{
-		case WM_PAINT:
-		{
-			PAINTSTRUCT ps;
-			HDC hdc = BeginPaint(hwnd, &ps);
-			//拿到image
-			if (!g_image.IsNull()) {
-				RECT client_rect;
-				GetClientRect(hwnd, &client_rect);
-				int client_width = client_rect.right - client_rect.left;
-				int client_height = client_rect.bottom - client_rect.top;
-				
-				int oldMode = SetStretchBltMode(hdc,HALFTONE);//设置拉伸模式
-				SetBrushOrgEx(hdc, 0, 0,NULL);//设置画刷远点,x选择HALFTONE模式必须设置					
-				EnterCriticalSection(&g_cri_sec);
-				int remote_width = g_image.GetWidth();
-				int remote_height = g_image.GetHeight();
-				g_image.StretchBlt(hdc, 0, 0, client_width, client_height, 0, 0, remote_width, remote_height, SRCCOPY);
-				LeaveCriticalSection(&g_cri_sec);
-				SetStretchBltMode(hdc, oldMode);
-			}
-			EndPaint(hwnd, &ps);
-		}
-		break;
-		case WM_MOUSEMOVE://鼠标移动
-		{
-			//拿到当前鼠标客户区的位置
-			int xPos = LOWORD(lParam);//低两字节是x坐标
-			int yPos = HIWORD(lParam);//高两字节是y坐标
-			RECT client_rect;
-			GetClientRect(hwnd, &client_rect);
-			int client_width = client_rect.right - client_rect.left;
-			int client_height = client_rect.bottom - client_rect.top;
-			if (g_remote_height != -1 && g_remote_width != -1) {
-				int rxPos = xPos * g_remote_width / client_width;
-				int ryPos = yPos * g_remote_height / client_height;
-				MOUSE mouse;
-				mouse.action = MOUSE_MOVE;
-				mouse.ptXY.x = rxPos;
-				mouse.ptXY.y = ryPos;
-				Packet* packet = PackPacket(CMD_MOUSE, (char*)&mouse.action, sizeof(MOUSE));
-				//send(g_server_socket, (char*)&packet->header.magic, GetPacketLen(packet), 0);
-				//free(packet);
-			}
-		}
-			break;
-		case WM_LBUTTONDOWN://鼠标左键按下
-		{
-			//拿到当前鼠标客户区的位置
-			int xPos = LOWORD(lParam);//低两字节是x坐标
-			int yPos = HIWORD(lParam);//高两字节是y坐标
-			RECT client_rect;
-			GetClientRect(hwnd, &client_rect);
-			int client_width = client_rect.right - client_rect.left;
-			int client_height = client_rect.bottom - client_rect.top;
-			if (g_remote_height != -1 && g_remote_width != -1) {
-				int rxPos = xPos * g_remote_width / client_width;
-				int ryPos = yPos * g_remote_height / client_height;
-				MOUSE mouse;
-				mouse.action = MOUSE_LDOWN;
-				mouse.ptXY.x = rxPos;
-				mouse.ptXY.y = ryPos;
-				Packet* packet = PackPacket(CMD_MOUSE, (char*)&mouse.action, sizeof(MOUSE));
-				send(g_server_socket, (char*)&packet->header.magic, GetPacketLen(packet), 0);
-				free(packet);
-			}
-		}
-			break;
-		case WM_LBUTTONUP://鼠标左键抬起
-		{
-			//拿到当前鼠标客户区的位置
-			int xPos = LOWORD(lParam);//低两字节是x坐标
-			int yPos = HIWORD(lParam);//高两字节是y坐标
-			RECT client_rect;
-			GetClientRect(hwnd, &client_rect);
-			int client_width = client_rect.right - client_rect.left;
-			int client_height = client_rect.bottom - client_rect.top;
-			if (g_remote_height != -1 && g_remote_width != -1) {
-				int rxPos = xPos * g_remote_width / client_width;
-				int ryPos = yPos * g_remote_height / client_height;
-				MOUSE mouse;
-				mouse.action = MOUSE_LUP;
-				mouse.ptXY.x = rxPos;
-				mouse.ptXY.y = ryPos;
-				Packet* packet = PackPacket(CMD_MOUSE, (char*)&mouse.action, sizeof(MOUSE));
-				send(g_server_socket, (char*)&packet->header.magic, GetPacketLen(packet), 0);
-				free(packet);
-			}
-		}
-			break;
-		case WM_LBUTTONDBLCLK://鼠标右键按下
-		{
-			//拿到当前鼠标客户区的位置
-			int xPos = LOWORD(lParam);//低两字节是x坐标
-			int yPos = HIWORD(lParam);//高两字节是y坐标
-			RECT client_rect;
-			GetClientRect(hwnd, &client_rect);
-			int client_width = client_rect.right - client_rect.left;
-			int client_height = client_rect.bottom - client_rect.top;
-			if (g_remote_height != -1 && g_remote_width != -1) {
-				int rxPos = xPos * g_remote_width / client_width;
-				int ryPos = yPos * g_remote_height / client_height;
-				MOUSE mouse;
-				mouse.action = MOUSE_LDCLICK;
-				mouse.ptXY.x = rxPos;
-				mouse.ptXY.y = ryPos;
-				Packet* packet = PackPacket(CMD_MOUSE, (char*)&mouse.action, sizeof(MOUSE));
-				send(g_server_socket, (char*)&packet->header.magic, GetPacketLen(packet), 0);
-				free(packet);
-			}
-		}
-		break;
-		case WM_RBUTTONDOWN://鼠标右键按下
-		{
-			//拿到当前鼠标客户区的位置
-			int xPos = LOWORD(lParam);//低两字节是x坐标
-			int yPos = HIWORD(lParam);//高两字节是y坐标
-			RECT client_rect;
-			GetClientRect(hwnd, &client_rect);
-			int client_width = client_rect.right - client_rect.left;
-			int client_height = client_rect.bottom - client_rect.top;
-			if (g_remote_height != -1 && g_remote_width != -1) {
-				int rxPos = xPos * g_remote_width / client_width;
-				int ryPos = yPos * g_remote_height / client_height;
-				MOUSE mouse;
-				mouse.action = MOUSE_RDOWN;
-				mouse.ptXY.x = rxPos;
-				mouse.ptXY.y = ryPos;
-				Packet* packet = PackPacket(CMD_MOUSE, (char*)&mouse.action, sizeof(MOUSE));
-				send(g_server_socket, (char*)&packet->header.magic, GetPacketLen(packet), 0);
-				free(packet);
-			}
-		}
-			break;
-		case WM_RBUTTONUP://鼠标右键抬起
-		{
-			//拿到当前鼠标客户区的位置
-			int xPos = LOWORD(lParam);//低两字节是x坐标
-			int yPos = HIWORD(lParam);//高两字节是y坐标
-			RECT client_rect;
-			GetClientRect(hwnd, &client_rect);
-			int client_width = client_rect.right - client_rect.left;
-			int client_height = client_rect.bottom - client_rect.top;
-			if (g_remote_height != -1 && g_remote_width != -1) {
-				int rxPos = xPos * g_remote_width / client_width;
-				int ryPos = yPos * g_remote_height / client_height;
-				MOUSE mouse;
-				mouse.action = MOUSE_RUP;
-				mouse.ptXY.x = rxPos;
-				mouse.ptXY.y = ryPos;
-				Packet* packet = PackPacket(CMD_MOUSE, (char*)&mouse.action, sizeof(MOUSE));
-				send(g_server_socket, (char*)&packet->header.magic, GetPacketLen(packet), 0);
-				free(packet);
-			}
-		}
-			break;
-		case WM_KEYDOWN:
-		{
-			KEYBOARD key_board;
-			key_board.vitrual_code = (int)wParam;
-			key_board.key_status = 0; // 按下
+int g_last_remote_x = -1;
+int g_last_remote_y = -1;
+DWORD g_last_mouse_send_time = 0;
 
-			Packet* packet = PackPacket(CMD_KEYBOARD, (char*)&key_board, sizeof(KEYBOARD));
-			send(g_server_socket, (char*)&packet->header.magic, GetPacketLen(packet), 0);
-			free(packet);
-		}
-		break;
+bool g_use_mouse_down_up = false;
+bool g_use_new_key_event = true;
 
-		case WM_KEYUP:
-		{
-			KEYBOARD key_board;
-			key_board.vitrual_code = (int)wParam;
-			key_board.key_status = 1; // 抬起
+std::atomic<bool> g_running(false);
+std::thread g_recv_thread;
 
-			Packet* packet = PackPacket(CMD_KEYBOARD, (char*)&key_board, sizeof(KEYBOARD));
-			send(g_server_socket, (char*)&packet->header.magic, GetPacketLen(packet), 0);
-			free(packet);
-		}
-		break;
-		case WM_SYSKEYDOWN:
-		{
-			KEYBOARD key_board;
-			key_board.vitrual_code = wParam;
-			key_board.key_status = 0;
-			Packet* packet = PackPacket(CMD_KEYBOARD, (char*)&key_board.vitrual_code, sizeof(KEYBOARD));
-			send(g_server_socket, (char*)&packet->header.magic, GetPacketLen(packet), 0);
-			free(packet);
-		}
-			break;
-	default:
-		return DefWindowProc(hwnd, msg, wParam, lParam);
-		break;
-	}
-	return 0;
-}
-//1.创建窗口的入口函数
-int WINAPI WinMain(
-	HINSTANCE hIstance,//当前实例句柄
-	HINSTANCE hPreventInstance,//前一个实例句柄（一般为null）
-	PSTR pCmdLine,//命令行参数
-	int nCmdShow//窗口显示方式
-) {
-	//初始化关键代码段
-	InitializeCriticalSection(&g_cri_sec);
-	InitWindow(hIstance, nCmdShow);
-	InitSocket();
-	//连接服务器
-	if (connect(g_server_socket, (sockaddr*)&g_server_addr, sizeof(g_server_addr)) == SOCKET_ERROR) {
-		printf("连接服务失败\r\n");
-		return 0;
-	}
-	unsigned long send_screen_thread_id = 0;
-	HANDLE handle_send_screen = CreateThread(NULL, 0, SendScreenCallBack, NULL, 0, &send_screen_thread_id);
-	OutputDebugString("连接成功\r\n");
-	//向服务器发送数据
-	
-	MSG msg = { 0 };
-	while (GetMessage(&msg, NULL, 0, 0)) {
-		//翻译消息
-		TranslateMessage(&msg);
-		DispatchMessage(&msg);
-	}
-}
-DWORD WINAPI SendScreenCallBack(LPVOID lpThreadParameter){
-	char* recv_buffer = (char*)malloc(RECV_BUFFER_LEN);
-	while (true)//不停发送数据
-	{
-		Packet* pack = PackPacket(CMD_SCREEN, NULL, 0);
-		int sen_len = send(g_server_socket, (char*)pack, GetPacketLen(pack), 0);
-		if (sen_len > 0) {
-			OutputDebugString("成功发送数据");
-		}
-		free(pack);
-		int len = recv(g_server_socket, recv_buffer, RECV_BUFFER_LEN, 0);
-		if (len > 0) {
-			Packet* pack = ParsePacket(recv_buffer, len);
-			if (pack != NULL) {//解析成功
-				//拿到图片数据
-				//绘制图片数据
-				HGLOBAL hMen = GlobalAlloc(GMEM_MOVEABLE, 0);
-				if (hMen == NULL) {
-					continue;
-				}
-				IStream* pStream = NULL;
-				HRESULT ret = CreateStreamOnHGlobal(hMen, true, &pStream);
-				//h_bitmap == NULL;
-				if (ret == S_OK) {
-					ULONG lenght = 0;
-					pStream->Write(pack->body, pack->header.body_len, &lenght);
-					free(pack);
-					EnterCriticalSection(&g_cri_sec);
-					LARGE_INTEGER lg = { 0 };
-					pStream->Seek(lg, STREAM_SEEK_SET, NULL);
-					if (!g_image.IsNull()){
-						g_image.Destroy();
-					}
-					g_image.Load(pStream);
-					if (g_remote_width == -1 && g_remote_height == -1) {
-						g_remote_width = g_image.GetWidth();
-						g_remote_height = g_image.GetHeight();
-					}
-					LeaveCriticalSection(&g_cri_sec);
-					InvalidateRect(g_hwnd, NULL, FALSE);
-					UpdateWindow(g_hwnd);
-				}
-			}
-		}
-	}
+std::mutex g_screen_mutex;
+std::vector<unsigned char> g_screen_bgra;
+int g_screen_width = 0;
+int g_screen_height = 0;
 
-}
-	//注册一个窗口类
+std::vector<unsigned char> g_frame_buffer;
+int g_frame_id = -1;
+int g_frame_width = 0;
+int g_frame_height = 0;
+int g_frame_total_size = 0;
+int g_frame_received_size = 0;
+int g_frame_format = 0;
+bool g_receiving_frame = false;
 
-int InitWindow(HINSTANCE hInstance, int nCmdShow) {
-	WNDCLASS ws = {0};
-	LPCSTR CLASS_NAME = "MainWindow";
-	ws.lpfnWndProc = winProc;//窗口消息的处理函数
-	ws.hInstance = hInstance;//实例句柄
-	ws.lpszClassName = CLASS_NAME;
-	ws.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1);
-	ws.hCursor = LoadCursor(NULL, IDC_ARROW);//光标
-	ws.style = CS_HREDRAW | CS_VREDRAW;//窗口大小发生变化时会重绘窗口
-	if (!RegisterClass(&ws)) {
-		MessageBox(NULL, "窗口注册失败", "错误", MB_OK | MB_ICONERROR);
-		return 0;
-	}
-	//创建窗口
-	g_hwnd = CreateWindow(
-		CLASS_NAME,//窗口类目
-		"远程控制",//窗口标题
-		WS_OVERLAPPEDWINDOW,//窗口样式
-		CW_USEDEFAULT, CW_USEDEFAULT,//窗口x，y的坐标
-		600, 400,//窗口的宽高
-		NULL,//父窗口的句柄
-		NULL,//菜单句柄
-		hInstance,
-		NULL
-	);
-	if (g_hwnd == NULL) {
-		MessageBox(NULL, "窗口创建失败", "错误", MB_OK | MB_ICONERROR);
-		return 0;
-	}
-	//3 显示窗口
-	ShowWindow(g_hwnd, nCmdShow);
-	//4更新窗口
-	UpdateWindow(g_hwnd);
-}
-	
+bool InitSocket();
+bool ConnectServer();
+int InitWindow(HINSTANCE hInstance, int nCmdShow);
 
-Packet* PackPacket(int cmd, char* buffer, int buffer_len)
+bool convertToRemotePoint(HWND hwnd, int xPos, int yPos, int& remote_x, int& remote_y);
+
+Packet buildPacket(int cmd, const char* msg);
+Packet buildRawPacket(int cmd, const char* buffer, int len);
+
+bool sendAll(SOCKET sock, const char* buf, int len);
+bool sendPacket(SOCKET sock, const Packet& pkt);
+
+void sendHello(SOCKET sock, const char* msg);
+void sendMouseEvent(SOCKET sock, int action, int button, int x, int y);
+void sendMouseEventFromWindow(HWND hwnd, LPARAM lParam, int action, int button);
+void sendKeyEvent(SOCKET sock, int key_status, const char* key);
+
+void sendKeyPressOld(SOCKET sock, const char* key);
+
+void recvThreadProc();
+void handleIncomingPacket(const Packet& pkt);
+void handleScreenBegin(const Packet& pkt);
+void handleScreenChunk(const Packet& pkt);
+void handleScreenEnd(const Packet& pkt);
+
+std::string vkToXdotoolKey(WPARAM wParam);
+
+void drawRemoteScreen(HDC hdc, RECT client_rect);
+
+LRESULT CALLBACK winProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 {
-	Packet* pck = (Packet*)malloc(buffer_len + sizeof(PacketHeader));
-	pck->header.magic = 0x55AA77CC;
-	pck->header.cmd = cmd;
-	pck->header.body_len = buffer_len;
-	if(buffer_len >0 && buffer != NULL)
-	{
-		memcpy(pck->body, buffer, buffer_len);
-	}
-	return pck;
-}
-Packet* ParsePacket(char* buffer, int len) {
-	Packet pck;
-	Packet* ppck;
-	//4字节包头
-	int index = 0;
-	for (;index < len;index++) {
-		//找包头
-		if (*(int*)(buffer + index) == 0x55AA77CC) {
-			pck.header.magic = *(int*)(buffer + index);
-			index += 4;
-			break;
-		}
-	}
-	pck.header.cmd = *(int*)(buffer + index);index += 4;
-	pck.header.body_len = *(int*)(buffer + index);index += 4;
-	if (pck.header.body_len == 0) {
-		ppck = (Packet*)malloc(sizeof(PacketHeader));
-		memcpy(&ppck->header, &pck.header, sizeof(PacketHeader));
-		return ppck;
-	}
-	//获取数据
-	if (pck.header.body_len > 0) {
-		//创建接受缓冲区
-		ppck = (Packet*)malloc(sizeof(PacketHeader) + pck.header.body_len);
-		//拷贝数据
-		memcpy(ppck->body, buffer + index, pck.header.body_len);
-		//拷贝包头
-		memcpy(&ppck->header, &pck.header, sizeof(PacketHeader));
-		return ppck;
-	}
-	return 0;
-}
-int InitSocket() {
-	// 初始化socket环境
-	WSADATA wsadata;
-	WSAStartup(MAKEWORD(2, 2), &wsadata);
+    switch (msg)
+    {
+    case WM_PAINT:
+    {
+        PAINTSTRUCT ps;
+        HDC hdc = BeginPaint(hwnd, &ps);
 
-	// 创建socket
-	g_server_socket = socket(AF_INET, SOCK_STREAM, 0);
-	if (g_server_socket == INVALID_SOCKET) {
-		printf("创建socket失败\r\n");
-		return 0;
-	}
+        RECT client_rect;
+        GetClientRect(hwnd, &client_rect);
 
-	// 设置服务器地址
-	g_server_addr.sin_family = AF_INET;
-	g_server_addr.sin_port = htons(9999); // 转为网络字节序
-	g_server_addr.sin_addr.S_un.S_addr = inet_addr("[REMOVED_PRIVATE_IP]");
+        drawRemoteScreen(hdc, client_rect);
+
+        EndPaint(hwnd, &ps);
+    }
+    break;
+
+    case WM_MOUSEMOVE:
+    {
+        if (g_server_socket == INVALID_SOCKET) {
+            break;
+        }
+
+        int xPos = LOWORD(lParam);
+        int yPos = HIWORD(lParam);
+
+        int remote_x = 0;
+        int remote_y = 0;
+
+        if (!convertToRemotePoint(hwnd, xPos, yPos, remote_x, remote_y)) {
+            break;
+        }
+
+        DWORD now = GetTickCount();
+
+        if (now - g_last_mouse_send_time < 20) {
+            break;
+        }
+
+        if (remote_x == g_last_remote_x && remote_y == g_last_remote_y) {
+            break;
+        }
+
+        sendMouseEvent(g_server_socket, MOUSE_ACTION_MOVE, 0, remote_x, remote_y);
+
+        g_last_remote_x = remote_x;
+        g_last_remote_y = remote_y;
+        g_last_mouse_send_time = now;
+    }
+    break;
+
+    case WM_LBUTTONDOWN:
+    {
+        SetFocus(hwnd);
+
+        if (g_use_mouse_down_up) {
+            sendMouseEventFromWindow(hwnd, lParam, MOUSE_ACTION_DOWN, 1);
+        }
+        else {
+            sendMouseEventFromWindow(hwnd, lParam, MOUSE_ACTION_CLICK, 1);
+        }
+    }
+    break;
+
+    case WM_LBUTTONUP:
+    {
+        if (g_use_mouse_down_up) {
+            sendMouseEventFromWindow(hwnd, lParam, MOUSE_ACTION_UP, 1);
+        }
+    }
+    break;
+
+    case WM_RBUTTONDOWN:
+    {
+        SetFocus(hwnd);
+
+        if (g_use_mouse_down_up) {
+            sendMouseEventFromWindow(hwnd, lParam, MOUSE_ACTION_DOWN, 3);
+        }
+        else {
+            sendMouseEventFromWindow(hwnd, lParam, MOUSE_ACTION_CLICK, 3);
+        }
+    }
+    break;
+
+    case WM_RBUTTONUP:
+    {
+        if (g_use_mouse_down_up) {
+            sendMouseEventFromWindow(hwnd, lParam, MOUSE_ACTION_UP, 3);
+        }
+    }
+    break;
+
+    case WM_MBUTTONDOWN:
+    {
+        SetFocus(hwnd);
+
+        if (g_use_mouse_down_up) {
+            sendMouseEventFromWindow(hwnd, lParam, MOUSE_ACTION_DOWN, 2);
+        }
+        else {
+            sendMouseEventFromWindow(hwnd, lParam, MOUSE_ACTION_CLICK, 2);
+        }
+    }
+    break;
+
+    case WM_MBUTTONUP:
+    {
+        if (g_use_mouse_down_up) {
+            sendMouseEventFromWindow(hwnd, lParam, MOUSE_ACTION_UP, 2);
+        }
+    }
+    break;
+
+    case WM_LBUTTONDBLCLK:
+    {
+        SetFocus(hwnd);
+        sendMouseEventFromWindow(hwnd, lParam, MOUSE_ACTION_DOUBLE_CLICK, 1);
+    }
+    break;
+
+    case WM_MOUSEWHEEL:
+    {
+        if (g_server_socket == INVALID_SOCKET) {
+            break;
+        }
+
+        int delta = GET_WHEEL_DELTA_WPARAM(wParam);
+        int button = delta > 0 ? 4 : 5;
+
+        POINT pt;
+        pt.x = LOWORD(lParam);
+        pt.y = HIWORD(lParam);
+        ScreenToClient(hwnd, &pt);
+
+        LPARAM fake_lParam = MAKELPARAM(pt.x, pt.y);
+        sendMouseEventFromWindow(hwnd, fake_lParam, MOUSE_ACTION_CLICK, button);
+    }
+    break;
+
+    case WM_KEYDOWN:
+    {
+        if (g_server_socket == INVALID_SOCKET) {
+            break;
+        }
+
+        std::string key = vkToXdotoolKey(wParam);
+
+        if (key.empty()) {
+            break;
+        }
+
+        if (g_use_new_key_event) {
+            if (lParam & (1 << 30)) {
+                break;
+            }
+
+            sendKeyEvent(g_server_socket, KEY_STATUS_DOWN, key.c_str());
+        }
+        else {
+            sendKeyPressOld(g_server_socket, key.c_str());
+        }
+    }
+    break;
+
+    case WM_KEYUP:
+    {
+        if (g_server_socket == INVALID_SOCKET) {
+            break;
+        }
+
+        if (!g_use_new_key_event) {
+            break;
+        }
+
+        std::string key = vkToXdotoolKey(wParam);
+
+        if (key.empty()) {
+            break;
+        }
+
+        sendKeyEvent(g_server_socket, KEY_STATUS_UP, key.c_str());
+    }
+    break;
+
+    case WM_DESTROY:
+    {
+        g_running = false;
+
+        if (g_server_socket != INVALID_SOCKET) {
+            shutdown(g_server_socket, SD_BOTH);
+            closesocket(g_server_socket);
+            g_server_socket = INVALID_SOCKET;
+        }
+
+        if (g_recv_thread.joinable()) {
+            g_recv_thread.join();
+        }
+
+        WSACleanup();
+        PostQuitMessage(0);
+    }
+    break;
+
+    default:
+        return DefWindowProc(hwnd, msg, wParam, lParam);
+    }
+
+    return 0;
+}
+
+int WINAPI WinMain(
+    HINSTANCE hInstance,
+    HINSTANCE hPrevInstance,
+    PSTR pCmdLine,
+    int nCmdShow
+)
+{
+    AllocConsole();
+    freopen("CONOUT$", "w", stdout);
+    freopen("CONOUT$", "w", stderr);
+
+    if (!InitSocket()) {
+        MessageBoxA(NULL, "InitSocket failed", "error", MB_OK | MB_ICONERROR);
+        return 0;
+    }
+
+    if (!ConnectServer()) {
+        MessageBoxA(NULL, "Connect Linux server failed", "error", MB_OK | MB_ICONERROR);
+        WSACleanup();
+        return 0;
+    }
+
+    if (!InitWindow(hInstance, nCmdShow)) {
+        WSACleanup();
+        return 0;
+    }
+
+    sendHello(g_server_socket, "hello linux window client");
+
+    g_running = true;
+    g_recv_thread = std::thread(recvThreadProc);
+
+    MSG msg = { 0 };
+
+    while (GetMessage(&msg, NULL, 0, 0)) {
+        TranslateMessage(&msg);
+        DispatchMessage(&msg);
+    }
+
+    return 0;
+}
+
+int InitWindow(HINSTANCE hInstance, int nCmdShow)
+{
+    WNDCLASSA wc = {};
+    LPCSTR CLASS_NAME = "RemoteControlWindow";
+
+    wc.lpfnWndProc = winProc;
+    wc.hInstance = hInstance;
+    wc.lpszClassName = CLASS_NAME;
+    wc.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1);
+    wc.hCursor = LoadCursor(NULL, IDC_ARROW);
+    wc.style = CS_HREDRAW | CS_VREDRAW | CS_DBLCLKS;
+
+    if (!RegisterClassA(&wc)) {
+        MessageBoxA(NULL, "Window class register failed", "error", MB_OK | MB_ICONERROR);
+        return 0;
+    }
+
+    g_hwnd = CreateWindowA(
+        CLASS_NAME,
+        "Windows to Linux Remote Control",
+        WS_OVERLAPPEDWINDOW,
+        CW_USEDEFAULT,
+        CW_USEDEFAULT,
+        1000,
+        700,
+        NULL,
+        NULL,
+        hInstance,
+        NULL
+    );
+
+    if (g_hwnd == NULL) {
+        MessageBoxA(NULL, "CreateWindow failed", "error", MB_OK | MB_ICONERROR);
+        return 0;
+    }
+
+    ShowWindow(g_hwnd, nCmdShow);
+    UpdateWindow(g_hwnd);
+
+    return 1;
+}
+
+bool InitSocket()
+{
+    WSADATA wsaData;
+    int ret = WSAStartup(MAKEWORD(2, 2), &wsaData);
+
+    if (ret != 0) {
+        std::cout << "WSAStartup failed: " << ret << std::endl;
+        return false;
+    }
+
+    g_server_socket = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+
+    if (g_server_socket == INVALID_SOCKET) {
+        std::cout << "socket failed: " << WSAGetLastError() << std::endl;
+        WSACleanup();
+        return false;
+    }
+
+    g_server_addr.sin_family = AF_INET;
+    g_server_addr.sin_port = htons(8080);
+    g_server_addr.sin_addr.s_addr = inet_addr("[REMOVED_PRIVATE_IP]");
+
+    return true;
+}
+
+bool ConnectServer()
+{
+    int ret = connect(
+        g_server_socket,
+        (sockaddr*)&g_server_addr,
+        sizeof(g_server_addr)
+    );
+
+    if (ret == SOCKET_ERROR) {
+        std::cout << "connect failed: " << WSAGetLastError() << std::endl;
+        closesocket(g_server_socket);
+        g_server_socket = INVALID_SOCKET;
+        return false;
+    }
+
+    std::cout << "connect success!" << std::endl;
+    return true;
+}
+
+bool convertToRemotePoint(HWND hwnd, int xPos, int yPos, int& remote_x, int& remote_y)
+{
+    RECT client_rect;
+    GetClientRect(hwnd, &client_rect);
+
+    int client_width = client_rect.right - client_rect.left;
+    int client_height = client_rect.bottom - client_rect.top;
+
+    if (client_width <= 0 || client_height <= 0) {
+        return false;
+    }
+
+    int target_width = g_remote_width;
+    int target_height = g_remote_height;
+
+    {
+        std::lock_guard<std::mutex> lock(g_screen_mutex);
+        if (g_screen_width > 0 && g_screen_height > 0) {
+            target_width = g_screen_width;
+            target_height = g_screen_height;
+        }
+    }
+
+    remote_x = xPos * target_width / client_width;
+    remote_y = yPos * target_height / client_height;
+
+    return true;
+}
+
+Packet buildPacket(int cmd, const char* msg)
+{
+    Packet pkt;
+    memset(&pkt, 0, sizeof(pkt));
+
+    pkt.magic = PACKET_MAGIC;
+    pkt.cmd = cmd;
+
+    if (msg == nullptr) {
+        pkt.body_len = 0;
+        return pkt;
+    }
+
+    int len = (int)strlen(msg);
+
+    if (len >= PACKET_DATA_SIZE) {
+        len = PACKET_DATA_SIZE - 1;
+    }
+
+    pkt.body_len = len;
+    memcpy(pkt.data, msg, len);
+    pkt.data[len] = '\0';
+
+    return pkt;
+}
+
+Packet buildRawPacket(int cmd, const char* buffer, int len)
+{
+    Packet pkt;
+    memset(&pkt, 0, sizeof(pkt));
+
+    pkt.magic = PACKET_MAGIC;
+    pkt.cmd = cmd;
+
+    if (buffer == nullptr || len <= 0) {
+        pkt.body_len = 0;
+        return pkt;
+    }
+
+    if (len > PACKET_DATA_SIZE) {
+        len = PACKET_DATA_SIZE - 1;
+    }
+
+    pkt.body_len = len;
+    memcpy(pkt.data, buffer, len);
+
+    return pkt;
+}
+
+bool sendAll(SOCKET sock, const char* buf, int len)
+{
+    int total = 0;
+
+    while (total < len) {
+        int n = send(sock, buf + total, len - total, 0);
+
+        if (n == SOCKET_ERROR) {
+            std::cout << "send failed: " << WSAGetLastError() << std::endl;
+            return false;
+        }
+
+        if (n == 0) {
+            std::cout << "connection closed while sending" << std::endl;
+            return false;
+        }
+
+        total += n;
+    }
+
+    return true;
+}
+
+bool sendPacket(SOCKET sock, const Packet& pkt)
+{
+    int len = 0;
+
+    char* buf = encodePacket(&pkt, &len);
+
+    if (buf == NULL || len <= 0) {
+        return false;
+    }
+
+    bool ok = sendAll(sock, buf, len);
+
+    free(buf);
+
+    return ok;
+}
+
+void sendHello(SOCKET sock, const char* msg)
+{
+    Packet pkt = buildPacket(CMD_HELLO, msg);
+    sendPacket(sock, pkt);
+
+    std::cout << "send hello: " << msg << std::endl;
+}
+
+void sendMouseEvent(SOCKET sock, int action, int button, int x, int y)
+{
+    MouseEvent event;
+    memset(&event, 0, sizeof(event));
+
+    event.action = action;
+    event.button = button;
+    event.x = x;
+    event.y = y;
+
+    Packet pkt = buildRawPacket(
+        CMD_MOUSE_EVENT,
+        (const char*)&event,
+        sizeof(MouseEvent)
+    );
+
+    sendPacket(sock, pkt);
+
+    std::cout << "send mouse event action=" << action
+        << " button=" << button
+        << " x=" << x
+        << " y=" << y
+        << std::endl;
+}
+
+void sendMouseEventFromWindow(HWND hwnd, LPARAM lParam, int action, int button)
+{
+    if (g_server_socket == INVALID_SOCKET) {
+        return;
+    }
+
+    int xPos = LOWORD(lParam);
+    int yPos = HIWORD(lParam);
+
+    int remote_x = 0;
+    int remote_y = 0;
+
+    if (!convertToRemotePoint(hwnd, xPos, yPos, remote_x, remote_y)) {
+        return;
+    }
+
+    sendMouseEvent(g_server_socket, action, button, remote_x, remote_y);
+}
+
+void sendKeyEvent(SOCKET sock, int key_status, const char* key)
+{
+    if (key == nullptr) {
+        return;
+    }
+
+    KeyEvent event;
+    memset(&event, 0, sizeof(event));
+
+    event.key_status = key_status;
+
+    strncpy(event.key, key, sizeof(event.key) - 1);
+    event.key[sizeof(event.key) - 1] = '\0';
+
+    Packet pkt = buildRawPacket(
+        CMD_KEY_EVENT,
+        (const char*)&event,
+        sizeof(KeyEvent)
+    );
+
+    sendPacket(sock, pkt);
+
+    std::cout << "send key event status=" << key_status
+        << " key=" << event.key
+        << std::endl;
+}
+
+void sendKeyPressOld(SOCKET sock, const char* key)
+{
+    Packet pkt = buildPacket(CMD_KEY_PRESS, key);
+    sendPacket(sock, pkt);
+
+    std::cout << "send old key press: " << key << std::endl;
+}
+
+void recvThreadProc()
+{
+    char buffer[262144] = { 0 };
+    int offset = 0;
+
+    while (g_running) {
+        int len = recv(g_server_socket, buffer + offset, sizeof(buffer) - offset, 0);
+
+        if (len <= 0) {
+            std::cout << "recv thread stopped" << std::endl;
+            break;
+        }
+
+        offset += len;
+
+        while (true) {
+            if (offset < 12) {
+                break;
+            }
+
+            int body_len = 0;
+            memcpy(&body_len, buffer + 8, sizeof(int));
+
+            if (body_len < 0 || body_len > PACKET_DATA_SIZE) {
+                std::cout << "invalid body_len from server: " << body_len << std::endl;
+                offset = 0;
+                break;
+            }
+
+            if (offset < 12 + body_len) {
+                break;
+            }
+
+            Packet pkt = decodePacket(buffer);
+            handleIncomingPacket(pkt);
+
+            int pack_size = 12 + body_len;
+
+            memmove(buffer, buffer + pack_size, offset - pack_size);
+            offset -= pack_size;
+        }
+
+        if (offset >= (int)sizeof(buffer)) {
+            offset = 0;
+        }
+    }
+
+    g_running = false;
+}
+
+void handleIncomingPacket(const Packet& pkt)
+{
+    if (pkt.magic != PACKET_MAGIC) {
+        std::cout << "invalid packet magic from server" << std::endl;
+        return;
+    }
+
+    if (pkt.cmd == CMD_SCREEN_BEGIN) {
+        handleScreenBegin(pkt);
+    }
+    else if (pkt.cmd == CMD_SCREEN_CHUNK) {
+        handleScreenChunk(pkt);
+    }
+    else if (pkt.cmd == CMD_SCREEN_END) {
+        handleScreenEnd(pkt);
+    }
+    else if (pkt.cmd == CMD_HELLO) {
+        std::cout << "server hello: " << pkt.data << std::endl;
+    }
+    else {
+        std::cout << "recv packet cmd=" << pkt.cmd << " len=" << pkt.body_len << std::endl;
+    }
+}
+
+void handleScreenBegin(const Packet& pkt)
+{
+    if (pkt.body_len != sizeof(ScreenFrameInfo)) {
+        std::cout << "invalid screen begin len=" << pkt.body_len << std::endl;
+        return;
+    }
+
+    ScreenFrameInfo info;
+    memcpy(&info, pkt.data, sizeof(info));
+
+    if (info.width <= 0 || info.height <= 0 || info.total_size <= 0) {
+        std::cout << "invalid screen frame info" << std::endl;
+        return;
+    }
+
+    if (info.format != SCREEN_FORMAT_BGRA32) {
+        std::cout << "unsupported screen format=" << info.format << std::endl;
+        return;
+    }
+
+    if (info.total_size != info.width * info.height * 4) {
+        std::cout << "invalid screen total size" << std::endl;
+        return;
+    }
+
+    if (info.total_size > 100 * 1024 * 1024) {
+        std::cout << "screen frame too large" << std::endl;
+        return;
+    }
+
+    g_frame_id = info.frame_id;
+    g_frame_width = info.width;
+    g_frame_height = info.height;
+    g_frame_total_size = info.total_size;
+    g_frame_received_size = 0;
+    g_frame_format = info.format;
+    g_receiving_frame = true;
+
+    g_frame_buffer.clear();
+    g_frame_buffer.resize(g_frame_total_size);
+
+    std::cout << "screen begin frame=" << g_frame_id
+        << " " << g_frame_width
+        << "x" << g_frame_height
+        << " size=" << g_frame_total_size
+        << std::endl;
+}
+
+void handleScreenChunk(const Packet& pkt)
+{
+    int header_size = sizeof(ScreenChunkHeader);
+
+    if (!g_receiving_frame) {
+        return;
+    }
+
+    if (pkt.body_len < header_size) {
+        std::cout << "invalid screen chunk len=" << pkt.body_len << std::endl;
+        return;
+    }
+
+    ScreenChunkHeader header;
+    memcpy(&header, pkt.data, header_size);
+
+    if (header.frame_id != g_frame_id) {
+        return;
+    }
+
+    if (header.data_len <= 0) {
+        return;
+    }
+
+    if (header.offset < 0 || header.offset + header.data_len > g_frame_total_size) {
+        std::cout << "invalid screen chunk offset" << std::endl;
+        return;
+    }
+
+    if (header_size + header.data_len > pkt.body_len) {
+        std::cout << "invalid screen chunk payload" << std::endl;
+        return;
+    }
+
+    memcpy(
+        g_frame_buffer.data() + header.offset,
+        pkt.data + header_size,
+        header.data_len
+    );
+
+    g_frame_received_size += header.data_len;
+}
+
+void handleScreenEnd(const Packet& pkt)
+{
+    if (pkt.body_len != sizeof(int)) {
+        std::cout << "invalid screen end len=" << pkt.body_len << std::endl;
+        return;
+    }
+
+    int end_frame_id = -1;
+    memcpy(&end_frame_id, pkt.data, sizeof(int));
+
+    if (!g_receiving_frame || end_frame_id != g_frame_id) {
+        return;
+    }
+
+    if (g_frame_received_size < g_frame_total_size) {
+        std::cout << "screen frame incomplete received="
+            << g_frame_received_size
+            << " total=" << g_frame_total_size
+            << std::endl;
+        g_receiving_frame = false;
+        return;
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(g_screen_mutex);
+        g_screen_bgra = g_frame_buffer;
+        g_screen_width = g_frame_width;
+        g_screen_height = g_frame_height;
+    }
+
+    g_receiving_frame = false;
+
+    if (g_hwnd != NULL) {
+        InvalidateRect(g_hwnd, NULL, FALSE);
+    }
+
+    std::cout << "screen frame ready frame=" << end_frame_id << std::endl;
+}
+
+void drawRemoteScreen(HDC hdc, RECT client_rect)
+{
+    std::vector<unsigned char> local_screen;
+    int width = 0;
+    int height = 0;
+
+    {
+        std::lock_guard<std::mutex> lock(g_screen_mutex);
+        local_screen = g_screen_bgra;
+        width = g_screen_width;
+        height = g_screen_height;
+    }
+
+    int client_width = client_rect.right - client_rect.left;
+    int client_height = client_rect.bottom - client_rect.top;
+
+    if (local_screen.empty() || width <= 0 || height <= 0) {
+        const char* text1 = "Windows -> Linux Remote Control";
+        const char* text2 = "Waiting for Linux screen frames...";
+        const char* text3 = "Mouse and keyboard events can still be sent.";
+
+        TextOutA(hdc, 20, 20, text1, (int)strlen(text1));
+        TextOutA(hdc, 20, 50, text2, (int)strlen(text2));
+        TextOutA(hdc, 20, 80, text3, (int)strlen(text3));
+        return;
+    }
+
+    BITMAPINFO bmi;
+    memset(&bmi, 0, sizeof(bmi));
+
+    bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    bmi.bmiHeader.biWidth = width;
+    bmi.bmiHeader.biHeight = -height;
+    bmi.bmiHeader.biPlanes = 1;
+    bmi.bmiHeader.biBitCount = 32;
+    bmi.bmiHeader.biCompression = BI_RGB;
+
+    StretchDIBits(
+        hdc,
+        0,
+        0,
+        client_width,
+        client_height,
+        0,
+        0,
+        width,
+        height,
+        local_screen.data(),
+        &bmi,
+        DIB_RGB_COLORS,
+        SRCCOPY
+    );
+}
+
+std::string vkToXdotoolKey(WPARAM wParam)
+{
+    if (wParam >= 'A' && wParam <= 'Z') {
+        char key[2] = { (char)wParam, '\0' };
+        return key;
+    }
+
+    if (wParam >= '0' && wParam <= '9') {
+        char key[2] = { (char)wParam, '\0' };
+        return key;
+    }
+
+    if (wParam >= VK_F1 && wParam <= VK_F12) {
+        int index = (int)(wParam - VK_F1) + 1;
+        char key[8];
+        snprintf(key, sizeof(key), "F%d", index);
+        return key;
+    }
+
+    switch (wParam)
+    {
+    case VK_RETURN:
+        return "Return";
+    case VK_BACK:
+        return "BackSpace";
+    case VK_TAB:
+        return "Tab";
+    case VK_ESCAPE:
+        return "Escape";
+    case VK_SPACE:
+        return "space";
+    case VK_LEFT:
+        return "Left";
+    case VK_RIGHT:
+        return "Right";
+    case VK_UP:
+        return "Up";
+    case VK_DOWN:
+        return "Down";
+    case VK_SHIFT:
+        return "Shift_L";
+    case VK_CONTROL:
+        return "Control_L";
+    case VK_MENU:
+        return "Alt_L";
+    case VK_DELETE:
+        return "Delete";
+    case VK_INSERT:
+        return "Insert";
+    case VK_HOME:
+        return "Home";
+    case VK_END:
+        return "End";
+    case VK_PRIOR:
+        return "Page_Up";
+    case VK_NEXT:
+        return "Page_Down";
+    case VK_CAPITAL:
+        return "Caps_Lock";
+    case VK_OEM_MINUS:
+        return "minus";
+    case VK_OEM_PLUS:
+        return "equal";
+    case VK_OEM_4:
+        return "bracketleft";
+    case VK_OEM_6:
+        return "bracketright";
+    case VK_OEM_1:
+        return "semicolon";
+    case VK_OEM_7:
+        return "apostrophe";
+    case VK_OEM_COMMA:
+        return "comma";
+    case VK_OEM_PERIOD:
+        return "period";
+    case VK_OEM_2:
+        return "slash";
+    case VK_OEM_5:
+        return "backslash";
+    case VK_OEM_3:
+        return "grave";
+    default:
+        return "";
+    }
 }
