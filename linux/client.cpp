@@ -7,6 +7,8 @@
 #include <cstdlib>
 #include <cstdio>
 #include <vector>
+#include <algorithm>
+
 #include <X11/Xlib.h>
 #include <X11/Xutil.h>
 
@@ -16,15 +18,21 @@
 // 全局变量：屏幕帧接收状态
 // ================================
 std::vector<unsigned char> g_frame_buffer;
+
 int g_frame_id = -1;
 int g_frame_width = 0;
 int g_frame_height = 0;
 int g_frame_total_size = 0;
 int g_frame_received_size = 0;
 bool g_receiving_frame = false;
+
+// ================================
+// 全局变量：X11 显示窗口状态
+// ================================
 Display* g_display = nullptr;
 Window g_window = 0;
 GC g_gc = 0;
+
 int g_window_width = 0;
 int g_window_height = 0;
 
@@ -40,12 +48,18 @@ Packet buildRawPacket(int cmd, const char* buffer, int len);
 void sendKeyEvent(int sock, int key_status, const char* key);
 void sendKeyClick(int sock, const char* key);
 
+void sendMouseEvent(int sock, int action, int button, int x, int y);
+bool convertLocalToRemote(int local_x, int local_y, int& remote_x, int& remote_y);
+void handleX11Events(int sock);
+
 bool initDisplayWindow(int width, int height);
 void drawFrameToWindow();
 void closeDisplayWindow();
+
 void handleScreenBegin(const Packet& pkt);
 void handleScreenChunk(const Packet& pkt);
 void handleScreenEnd(const Packet& pkt);
+
 void handlePacket(const Packet& pkt);
 void recvLoop(int sock);
 
@@ -64,6 +78,9 @@ int main()
 
     // ================================
     // 2. 配置 Windows server 地址
+    // 说明：
+    //   这里需要改成当前 Windows server 所在机器的 IP。
+    //   原来虚拟机 NAT 环境下可能是 [REMOVED_PRIVATE_IP]。
     // ================================
     sockaddr_in server_addr = {};
     server_addr.sin_family = AF_INET;
@@ -105,21 +122,17 @@ int main()
     }
 
     // ================================
-    // 5. 发送一次键盘测试事件
-    // 当前只是验证 Linux client -> Windows server 的键盘事件链路
-    // ================================
-    std::cout << "please click Notepad or input box in Windows..." << std::endl;
-    sleep(1);
-    sendKeyClick(sock, "A");
-
-    // ================================
-    // 6. 持续接收 Windows server 发来的 hello 和屏幕帧
+    // 5. 持续接收 Windows server 发来的 hello 和屏幕帧
+    // 说明：
+    //   之前这里有 sendKeyClick(sock, "A") 测试代码，
+    //   现在已经删除，避免每次启动都往 Windows 当前窗口输入 A。
     // ================================
     recvLoop(sock);
 
     // ================================
-    // 7. 关闭 socket
+    // 6. 清理资源
     // ================================
+    closeDisplayWindow();
     close(sock);
 
     return 0;
@@ -275,6 +288,140 @@ void sendKeyClick(int sock, const char* key)
 }
 
 // ================================
+// 函数功能：发送鼠标事件给 Windows server
+// 说明：
+//   Linux client 将鼠标动作封装成 MouseEvent，
+//   通过 CMD_MOUSE_EVENT 发送给 Windows server 执行。
+// ================================
+void sendMouseEvent(int sock, int action, int button, int x, int y)
+{
+    MouseEvent event = {};
+
+    event.action = action;
+    event.button = button;
+    event.x = x;
+    event.y = y;
+
+    Packet pkt = buildRawPacket(
+        CMD_MOUSE_EVENT,
+        (const char*)&event,
+        sizeof(MouseEvent)
+    );
+
+    sendPacket(sock, pkt);
+
+    // 鼠标移动事件非常高频，不打印移动日志，避免终端刷屏和卡顿。
+    if (action != MOUSE_ACTION_MOVE)
+    {
+        std::cout << "mouse event action=" << action
+                  << " button=" << button
+                  << " x=" << x
+                  << " y=" << y
+                  << std::endl;
+    }
+}
+
+// ================================
+// 函数功能：将 Linux client 窗口坐标换算成远程 Windows 屏幕坐标
+// 说明：
+//   g_window_width / g_window_height 是本地显示窗口大小。
+//   g_frame_width / g_frame_height 是远程 Windows 原始屏幕大小。
+// ================================
+bool convertLocalToRemote(int local_x, int local_y, int& remote_x, int& remote_y)
+{
+    if (g_window_width <= 0 || g_window_height <= 0)
+    {
+        return false;
+    }
+
+    if (g_frame_width <= 0 || g_frame_height <= 0)
+    {
+        return false;
+    }
+
+    remote_x = local_x * g_frame_width / g_window_width;
+    remote_y = local_y * g_frame_height / g_window_height;
+
+    if (remote_x < 0)
+    {
+        remote_x = 0;
+    }
+
+    if (remote_y < 0)
+    {
+        remote_y = 0;
+    }
+
+    if (remote_x >= g_frame_width)
+    {
+        remote_x = g_frame_width - 1;
+    }
+
+    if (remote_y >= g_frame_height)
+    {
+        remote_y = g_frame_height - 1;
+    }
+
+    return true;
+}
+
+// ================================
+// 函数功能：处理 Linux client 窗口中的 X11 输入事件
+// 说明：
+//   当前用于捕获用户在远程屏幕窗口中的鼠标移动和点击，
+//   并把窗口坐标转换为 Windows 屏幕坐标后发送给 Windows server。
+// ================================
+void handleX11Events(int sock)
+{
+    if (g_display == nullptr || g_window == 0)
+    {
+        return;
+    }
+
+    while (XPending(g_display) > 0)
+    {
+        XEvent event = {};
+        XNextEvent(g_display, &event);
+
+        if (event.type == Expose)
+        {
+            drawFrameToWindow();
+        }
+        else if (event.type == MotionNotify)
+        {
+            int local_x = event.xmotion.x;
+            int local_y = event.xmotion.y;
+
+            int remote_x = 0;
+            int remote_y = 0;
+
+            if (!convertLocalToRemote(local_x, local_y, remote_x, remote_y))
+            {
+                return;
+            }
+
+            sendMouseEvent(sock, MOUSE_ACTION_MOVE, 0, remote_x, remote_y);
+        }
+        else if (event.type == ButtonPress)
+        {
+            int local_x = event.xbutton.x;
+            int local_y = event.xbutton.y;
+            int button = event.xbutton.button;
+
+            int remote_x = 0;
+            int remote_y = 0;
+
+            if (!convertLocalToRemote(local_x, local_y, remote_x, remote_y))
+            {
+                return;
+            }
+
+            sendMouseEvent(sock, MOUSE_ACTION_CLICK, button, remote_x, remote_y);
+        }
+    }
+}
+
+// ================================
 // 函数功能：处理 Windows server 发来的 SCREEN_BEGIN 包
 // 作用：读取当前屏幕帧的基本信息，并准备接收缓冲区
 // ================================
@@ -391,8 +538,7 @@ void handleScreenChunk(const Packet& pkt)
 
 // ================================
 // 函数功能：处理 Windows server 发来的 SCREEN_END 包
-// 作用：判断当前帧是否接收完整
-// 当前版本：只验证接收完成，不保存文件、不显示窗口
+// 作用：判断当前帧是否接收完整，完整后初始化窗口并绘制屏幕帧
 // ================================
 void handleScreenEnd(const Packet& pkt)
 {
@@ -428,13 +574,8 @@ void handleScreenEnd(const Packet& pkt)
 
     g_receiving_frame = false;
 
-    std::cout << "screen frame received, frame_id="
-              << g_frame_id
-              << ", width=" << g_frame_width
-              << ", height=" << g_frame_height
-              << ", size=" << g_frame_received_size
-              << std::endl;
-    if (g_display == nullptr){
+    if (g_display == nullptr)
+    {
         if (!initDisplayWindow(g_frame_width, g_frame_height))
         {
             std::cout << "init display window failed" << std::endl;
@@ -555,6 +696,9 @@ void recvLoop(int sock)
 
             offset = remain;
         }
+
+        // 处理 Linux client 窗口里的鼠标移动、点击、重绘事件
+        handleX11Events(sock);
     }
 }
 
@@ -562,11 +706,8 @@ void recvLoop(int sock)
 // 函数功能：初始化 Linux client 的 X11 显示窗口
 // 作用：
 //   1. 连接本机 X11 图形环境
-//   2. 根据远程 Windows 屏幕宽高创建显示窗口
+//   2. 根据远程 Windows 屏幕比例创建合适大小的显示窗口
 //   3. 创建 GC 绘图上下文，供后续 drawFrameToWindow 使用
-// 返回值：
-//   true  初始化成功
-//   false 初始化失败
 // ================================
 bool initDisplayWindow(int width, int height)
 {
@@ -586,13 +727,39 @@ bool initDisplayWindow(int width, int height)
 
     int screen = DefaultScreen(g_display);
 
+    int local_screen_width = DisplayWidth(g_display, screen);
+    int local_screen_height = DisplayHeight(g_display, screen);
+
+    int max_window_width = local_screen_width * 9 / 10;
+    int max_window_height = local_screen_height * 9 / 10;
+
+    double scale_x = (double)max_window_width / width;
+    double scale_y = (double)max_window_height / height;
+    double scale = std::min(scale_x, scale_y);
+
+    if (scale > 1.0)
+    {
+        scale = 1.0;
+    }
+
+    int window_width = (int)(width * scale);
+    int window_height = (int)(height * scale);
+
+    if (window_width <= 0 || window_height <= 0)
+    {
+        std::cout << "calculated window size invalid" << std::endl;
+        XCloseDisplay(g_display);
+        g_display = nullptr;
+        return false;
+    }
+
     g_window = XCreateSimpleWindow(
         g_display,
         RootWindow(g_display, screen),
         0,
         0,
-        width,
-        height,
+        window_width,
+        window_height,
         1,
         BlackPixel(g_display, screen),
         WhitePixel(g_display, screen)
@@ -630,10 +797,15 @@ bool initDisplayWindow(int width, int height)
         return false;
     }
 
-    g_window_width = width;
-    g_window_height = height;
+    g_window_width = window_width;
+    g_window_height = window_height;
 
     XFlush(g_display);
+
+    std::cout << "display window init success: remote="
+              << width << "x" << height
+              << ", window=" << g_window_width << "x" << g_window_height
+              << std::endl;
 
     return true;
 }
@@ -642,7 +814,7 @@ bool initDisplayWindow(int width, int height)
 // 函数功能：将接收到的屏幕帧绘制到 Linux client 的 X11 窗口
 // 说明：
 //   g_frame_buffer 保存 Windows server 回传的 BGRA32 图像数据。
-//   本函数将当前完整帧包装成 XImage，并通过 XPutImage 绘制到 g_window。
+//   如果远程屏幕尺寸大于本地显示窗口，则先按比例缩放后再绘制。
 // ================================
 void drawFrameToWindow()
 {
@@ -661,6 +833,11 @@ void drawFrameToWindow()
         return;
     }
 
+    if (g_window_width <= 0 || g_window_height <= 0)
+    {
+        return;
+    }
+
     long long expected_size = 1LL * g_frame_width * g_frame_height * 4;
 
     if ((long long)g_frame_buffer.size() < expected_size)
@@ -669,11 +846,29 @@ void drawFrameToWindow()
         return;
     }
 
+    std::vector<unsigned char> scaled_frame(g_window_width * g_window_height * 4);
+
+    for (int y = 0; y < g_window_height; y++)
+    {
+        int src_y = y * g_frame_height / g_window_height;
+
+        for (int x = 0; x < g_window_width; x++)
+        {
+            int src_x = x * g_frame_width / g_window_width;
+
+            int src_index = (src_y * g_frame_width + src_x) * 4;
+            int dst_index = (y * g_window_width + x) * 4;
+
+            scaled_frame[dst_index + 0] = g_frame_buffer[src_index + 0];
+            scaled_frame[dst_index + 1] = g_frame_buffer[src_index + 1];
+            scaled_frame[dst_index + 2] = g_frame_buffer[src_index + 2];
+            scaled_frame[dst_index + 3] = 255;
+        }
+    }
+
     int screen = DefaultScreen(g_display);
     Visual* visual = DefaultVisual(g_display, screen);
     int depth = DefaultDepth(g_display, screen);
-
-    std::vector<unsigned char> local_frame = g_frame_buffer;
 
     XImage* image = XCreateImage(
         g_display,
@@ -681,9 +876,9 @@ void drawFrameToWindow()
         depth,
         ZPixmap,
         0,
-        (char*)local_frame.data(),
-        g_frame_width,
-        g_frame_height,
+        (char*)scaled_frame.data(),
+        g_window_width,
+        g_window_height,
         32,
         0
     );
@@ -703,8 +898,8 @@ void drawFrameToWindow()
         0,
         0,
         0,
-        g_frame_width,
-        g_frame_height
+        g_window_width,
+        g_window_height
     );
 
     XFlush(g_display);
@@ -713,3 +908,31 @@ void drawFrameToWindow()
     XDestroyImage(image);
 }
 
+// ================================
+// 函数功能：关闭 Linux client 的 X11 显示窗口并释放资源
+// ================================
+void closeDisplayWindow()
+{
+    if (g_display == nullptr)
+    {
+        return;
+    }
+
+    if (g_gc != 0)
+    {
+        XFreeGC(g_display, g_gc);
+        g_gc = 0;
+    }
+
+    if (g_window != 0)
+    {
+        XDestroyWindow(g_display, g_window);
+        g_window = 0;
+    }
+
+    XCloseDisplay(g_display);
+    g_display = nullptr;
+
+    g_window_width = 0;
+    g_window_height = 0;
+}

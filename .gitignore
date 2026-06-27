@@ -1,14 +1,23 @@
-linux/server
-linux/client
-*.o
-*.out
-.vscode/
-
 # Build outputs
 build/
-windows/build/
+*/build/
 *.exe
 *.o
 *.obj
 *.pdb
 *.ilk
+*.dll
+
+# Linux local binaries
+linux/client
+linux/server
+
+# Editor / system files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Temporary files
+*.log
+*.tmp
