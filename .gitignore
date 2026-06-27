@@ -3,3 +3,12 @@ linux/client
 *.o
 *.out
 .vscode/
+
+# Build outputs
+build/
+windows/build/
+*.exe
+*.o
+*.obj
+*.pdb
+*.ilk

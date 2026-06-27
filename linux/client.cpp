@@ -7,6 +7,8 @@
 #include <cstdlib>
 #include <cstdio>
 #include <vector>
+#include <X11/Xlib.h>
+#include <X11/Xutil.h>
 
 #include "../common/packet.h"
 
@@ -20,6 +22,11 @@ int g_frame_height = 0;
 int g_frame_total_size = 0;
 int g_frame_received_size = 0;
 bool g_receiving_frame = false;
+Display* g_display = nullptr;
+Window g_window = 0;
+GC g_gc = 0;
+int g_window_width = 0;
+int g_window_height = 0;
 
 // ================================
 // 函数声明
@@ -33,6 +40,9 @@ Packet buildRawPacket(int cmd, const char* buffer, int len);
 void sendKeyEvent(int sock, int key_status, const char* key);
 void sendKeyClick(int sock, const char* key);
 
+bool initDisplayWindow(int width, int height);
+void drawFrameToWindow();
+void closeDisplayWindow();
 void handleScreenBegin(const Packet& pkt);
 void handleScreenChunk(const Packet& pkt);
 void handleScreenEnd(const Packet& pkt);
@@ -424,6 +434,15 @@ void handleScreenEnd(const Packet& pkt)
               << ", height=" << g_frame_height
               << ", size=" << g_frame_received_size
               << std::endl;
+    if (g_display == nullptr){
+        if (!initDisplayWindow(g_frame_width, g_frame_height))
+        {
+            std::cout << "init display window failed" << std::endl;
+            return;
+        }
+    }
+
+    drawFrameToWindow();
 }
 
 // ================================
@@ -538,3 +557,159 @@ void recvLoop(int sock)
         }
     }
 }
+
+// ================================
+// 函数功能：初始化 Linux client 的 X11 显示窗口
+// 作用：
+//   1. 连接本机 X11 图形环境
+//   2. 根据远程 Windows 屏幕宽高创建显示窗口
+//   3. 创建 GC 绘图上下文，供后续 drawFrameToWindow 使用
+// 返回值：
+//   true  初始化成功
+//   false 初始化失败
+// ================================
+bool initDisplayWindow(int width, int height)
+{
+    if (width <= 0 || height <= 0)
+    {
+        std::cout << "invalid window size" << std::endl;
+        return false;
+    }
+
+    g_display = XOpenDisplay(nullptr);
+
+    if (g_display == nullptr)
+    {
+        std::cout << "XOpenDisplay failed" << std::endl;
+        return false;
+    }
+
+    int screen = DefaultScreen(g_display);
+
+    g_window = XCreateSimpleWindow(
+        g_display,
+        RootWindow(g_display, screen),
+        0,
+        0,
+        width,
+        height,
+        1,
+        BlackPixel(g_display, screen),
+        WhitePixel(g_display, screen)
+    );
+
+    if (g_window == 0)
+    {
+        std::cout << "XCreateSimpleWindow failed" << std::endl;
+        XCloseDisplay(g_display);
+        g_display = nullptr;
+        return false;
+    }
+
+    XStoreName(g_display, g_window, "Linux Client - Windows Screen");
+
+    XSelectInput(
+        g_display,
+        g_window,
+        ExposureMask | KeyPressMask | ButtonPressMask | PointerMotionMask
+    );
+
+    XMapWindow(g_display, g_window);
+
+    g_gc = XCreateGC(g_display, g_window, 0, nullptr);
+
+    if (g_gc == 0)
+    {
+        std::cout << "XCreateGC failed" << std::endl;
+        XDestroyWindow(g_display, g_window);
+        XCloseDisplay(g_display);
+
+        g_window = 0;
+        g_display = nullptr;
+
+        return false;
+    }
+
+    g_window_width = width;
+    g_window_height = height;
+
+    XFlush(g_display);
+
+    return true;
+}
+
+// ================================
+// 函数功能：将接收到的屏幕帧绘制到 Linux client 的 X11 窗口
+// 说明：
+//   g_frame_buffer 保存 Windows server 回传的 BGRA32 图像数据。
+//   本函数将当前完整帧包装成 XImage，并通过 XPutImage 绘制到 g_window。
+// ================================
+void drawFrameToWindow()
+{
+    if (g_display == nullptr || g_window == 0 || g_gc == 0)
+    {
+        return;
+    }
+
+    if (g_frame_buffer.empty())
+    {
+        return;
+    }
+
+    if (g_frame_width <= 0 || g_frame_height <= 0)
+    {
+        return;
+    }
+
+    long long expected_size = 1LL * g_frame_width * g_frame_height * 4;
+
+    if ((long long)g_frame_buffer.size() < expected_size)
+    {
+        std::cout << "frame buffer size invalid" << std::endl;
+        return;
+    }
+
+    int screen = DefaultScreen(g_display);
+    Visual* visual = DefaultVisual(g_display, screen);
+    int depth = DefaultDepth(g_display, screen);
+
+    std::vector<unsigned char> local_frame = g_frame_buffer;
+
+    XImage* image = XCreateImage(
+        g_display,
+        visual,
+        depth,
+        ZPixmap,
+        0,
+        (char*)local_frame.data(),
+        g_frame_width,
+        g_frame_height,
+        32,
+        0
+    );
+
+    if (image == nullptr)
+    {
+        std::cout << "XCreateImage failed" << std::endl;
+        return;
+    }
+
+    XPutImage(
+        g_display,
+        g_window,
+        g_gc,
+        image,
+        0,
+        0,
+        0,
+        0,
+        g_frame_width,
+        g_frame_height
+    );
+
+    XFlush(g_display);
+
+    image->data = nullptr;
+    XDestroyImage(image);
+}
+
