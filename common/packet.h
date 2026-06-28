@@ -2,7 +2,7 @@
 
 #include <string.h>
 #include <stdlib.h>
-const int PACKET_DATA_SIZE = 16384;
+const int PACKET_DATA_SIZE = 65536;
 
 struct Packet {
     int magic;

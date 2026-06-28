@@ -473,10 +473,10 @@ void handleMouseEvent(const char* data, int len)
         return;
     }
 
-    std::cout << "mouse event action=" << event.action
-              << " button=" << event.button
-              << " x=" << event.x
-              << " y=" << event.y << std::endl;
+    // std::cout << "mouse event action=" << event.action
+    //           << " button=" << event.button
+    //           << " x=" << event.x
+    //           << " y=" << event.y << std::endl;
 }
 
 bool keyNameToVk(const char* key, WORD& vk)
@@ -746,6 +746,6 @@ void screenSendLoop(SOCKET client_socket)
         }
 
         frame_id++;
-        Sleep(200);
+        Sleep(50);
     }
 }
