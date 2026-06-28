@@ -387,6 +387,12 @@ void handleX11Events(int sock)
         {
             drawFrameToWindow();
         }
+        else if (event.type == ConfigureNotify)
+        {
+            g_window_width = event.xconfigure.width;
+            g_window_height = event.xconfigure.height;
+            drawFrameToWindow();
+        }
         else if (event.type == MotionNotify)
         {
             int local_x = event.xmotion.x;
@@ -417,6 +423,20 @@ void handleX11Events(int sock)
             }
 
             sendMouseEvent(sock, MOUSE_ACTION_CLICK, button, remote_x, remote_y);
+        }
+        else if (event.type == KeyPress || event.type == KeyRelease)
+        {
+            KeySym keysym = XLookupKeysym(&event.xkey, 0);
+            const char* key_name = XKeysymToString(keysym);
+
+            if (key_name == nullptr)
+            {
+                std::cout << "unsupported key event" << std::endl;
+                continue;
+            }
+
+            int key_status = event.type == KeyPress ? KEY_STATUS_DOWN : KEY_STATUS_UP;
+            sendKeyEvent(sock, key_status, key_name);
         }
     }
 }
@@ -778,7 +798,12 @@ bool initDisplayWindow(int width, int height)
     XSelectInput(
         g_display,
         g_window,
-        ExposureMask | KeyPressMask | ButtonPressMask | PointerMotionMask
+        ExposureMask |
+        StructureNotifyMask |
+        KeyPressMask |
+        KeyReleaseMask |
+        ButtonPressMask |
+        PointerMotionMask
     );
 
     XMapWindow(g_display, g_window);

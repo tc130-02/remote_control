@@ -209,12 +209,18 @@ int acceptClient(int server_fd)
 // ================================
 void recvLoop(int client_fd)
 {
-    char buffer[1024] = {0};
+    char buffer[262144] = {0};
     int offset = 0;
 
     while (true)
     {
-        int len = recv(client_fd, buffer + offset, 1024 - offset, 0);
+        if (offset >= (int)sizeof(buffer))
+        {
+            std::cout << "recv buffer full, protocol error" << std::endl;
+            break;
+        }
+
+        int len = recv(client_fd, buffer + offset, sizeof(buffer) - offset, 0);
 
         if (len <= 0)
         {
@@ -364,9 +370,45 @@ void handleMouseEvent(const char *data, int len)
 
         std::cout << "mouse event double click button=" << event.button << std::endl;
     }
+    else if (event.action == MOUSE_ACTION_DOWN)
+    {
+        if (event.button != 1 &&
+            event.button != 2 &&
+            event.button != 3)
+        {
+            std::cout << "unsupported mouse down button=" << event.button << std::endl;
+            return;
+        }
+
+        snprintf(cmd, sizeof(cmd), "xdotool mousemove %d %d", event.x, event.y);
+        system(cmd);
+
+        snprintf(cmd, sizeof(cmd), "xdotool mousedown %d", event.button);
+        system(cmd);
+
+        std::cout << "mouse event down button=" << event.button << std::endl;
+    }
+    else if (event.action == MOUSE_ACTION_UP)
+    {
+        if (event.button != 1 &&
+            event.button != 2 &&
+            event.button != 3)
+        {
+            std::cout << "unsupported mouse up button=" << event.button << std::endl;
+            return;
+        }
+
+        snprintf(cmd, sizeof(cmd), "xdotool mousemove %d %d", event.x, event.y);
+        system(cmd);
+
+        snprintf(cmd, sizeof(cmd), "xdotool mouseup %d", event.button);
+        system(cmd);
+
+        std::cout << "mouse event up button=" << event.button << std::endl;
+    }
     else
     {
-        std::cout << "未知 MouseEvent action" << event.action << std::endl;
+        std::cout << "unsupported MouseEvent action=" << event.action << std::endl;
     }
 }
 

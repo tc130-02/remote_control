@@ -207,7 +207,9 @@ Packet buildRawPacket(int cmd, const char* buffer, int len)
     }
 
     if (len > PACKET_DATA_SIZE) {
-        len = PACKET_DATA_SIZE;
+        std::cout << "raw packet too large" << std::endl;
+        pkt.body_len = 0;
+        return pkt;
     }
 
     pkt.body_len = len;
