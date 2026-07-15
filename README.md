@@ -9,16 +9,18 @@
 ## 项目结构
 
 ```text
-remote_control_share/
+remote_control/
 ├── common/
 │   └── packet.h          # 公共协议定义：Packet、命令号、键鼠事件、屏幕帧结构
 ├── linux/
 │   ├── client.cpp        # Linux 控制端：接收 Windows 屏幕并发送鼠标/键盘事件
 │   └── server.cpp        # Linux 被控端：接收控制命令并回传 Linux 屏幕
 ├── windows/
+│   ├── CMakeLists.txt     # Windows 端 CMake 构建配置
 │   ├── client.cpp        # Windows 控制端
 │   └── server.cpp        # Windows 被控端：接收 Linux 控制并回传 Windows 屏幕
 ├── .gitignore
+├── LICENSE
 └── README.md
 ```
 
@@ -70,7 +72,15 @@ Windows server 使用 Win32 GDI 进行屏幕采集：
 
 Linux client 接收完整一帧后进行重组和显示。
 
-### 4. 键鼠事件传输
+### 4. Windows client 控制 Linux server
+
+当前已实现：
+
+* Windows client 连接 Linux server
+* Linux server 使用 X11/XShm 采集并回传 Linux 屏幕帧
+* Windows client 显示远程屏幕并发送鼠标/键盘事件
+
+### 5. 键鼠事件传输
 
 项目定义了统一的键鼠事件结构：
 
@@ -103,43 +113,54 @@ struct KeyEvent {
 
 ## 编译方式
 
-### Linux client
+### Linux
 
-需要安装 X11 开发库：
+需要安装编译工具和 X11 开发库：
 
 ```bash
-sudo apt install libx11-dev
+sudo apt install build-essential libx11-dev libxext-dev
 ```
 
-编译：
+编译 client 和 server：
 
 ```bash
 cd linux
 g++ client.cpp -o client -lX11
+g++ server.cpp -o server -lX11 -lXext -pthread
 ```
 
-运行：
+### Windows
 
-```bash
-./client
-```
-
-### Windows server
-
-使用 MinGW 编译：
+使用 CMake 编译 client 和 server。以下示例使用 MinGW：
 
 ```powershell
-cd windows
-g++ server.cpp -o win_server.exe -I..\common -lws2_32 -lgdi32 -luser32
+cmake -S windows -B windows/build -G "MinGW Makefiles"
+cmake --build windows/build
 ```
 
-运行：
+生成以下程序：
 
-```powershell
-.\win_server.exe
+* `win_client.exe`
+* `win_server.exe`
+
+也可根据本机环境选择 Ninja 或 Visual Studio 生成器。
+
+## 网络配置
+
+* Windows 和 Linux 服务端均监听所有本机 IPv4 网卡地址
+* TCP 端口统一为 `9999`
+* 服务端启动后会打印本机可用的 IPv4 地址
+* 客户端从自身可执行文件所在目录读取 `server.conf`
+
+`server.conf` 只保存一行服务端 IPv4 地址，不要添加端口或其他配置。格式示例：
+
+```text
+192.0.2.10
 ```
 
-如果使用 CMake，可根据本机编译器环境选择 Ninja、MinGW Makefiles 或 Visual Studio 生成器。
+请将示例替换为服务端启动时实际打印的 IPv4 地址。配置文件不存在、内容为空或 IPv4 格式错误时，客户端会打印错误并停止连接。
+
+`server.conf` 属于本机网络配置，已通过 `.gitignore` 忽略，请勿提交到代码仓库。
 
 ## 运行方式
 
@@ -148,30 +169,40 @@ g++ server.cpp -o win_server.exe -I..\common -lws2_32 -lgdi32 -luser32
 1. 在 Windows 机器上运行：
 
 ```powershell
+cd windows/build
 .\win_server.exe
 ```
 
-2. 查询 Windows 机器 IP：
+2. 将 Windows server 打印的 IPv4 地址写入 Linux `client` 可执行文件同目录下的 `server.conf`。
 
-```powershell
-ipconfig
-```
-
-3. 修改 `linux/client.cpp` 中的 Windows server IP：
-
-```cpp
-server_addr.sin_addr.s_addr = inet_addr("你的 Windows IP");
-```
-
-4. 在 Linux 端重新编译并运行：
+3. 在 Linux 端运行：
 
 ```bash
 cd linux
-g++ client.cpp -o client -lX11
 ./client
 ```
 
 连接成功后，Linux client 会显示 Windows 屏幕，并支持在显示窗口内移动和点击鼠标来控制 Windows。
+
+### Windows client 连接 Linux server
+
+1. 在 Linux 机器上运行：
+
+```bash
+cd linux
+./server
+```
+
+2. 将 Linux server 打印的 IPv4 地址写入 `win_client.exe` 同目录下的 `server.conf`。
+
+3. 运行 Windows client：
+
+```powershell
+cd windows/build
+.\win_client.exe
+```
+
+如果连接失败，请确认服务端与客户端网络互通，并允许防火墙放行 TCP `9999` 端口。
 
 ## 项目特点
 
