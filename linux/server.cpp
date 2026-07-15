@@ -4,8 +4,10 @@
 #include <string.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
+#include <netdb.h>
 #include <cstdio>
 #include <cstdlib>
+#include <string>
 #include <vector>
 #include <algorithm>
 #include <X11/Xlib.h>
@@ -35,20 +37,24 @@ bool sendPacket(int sock, const Packet &pkt);
 void sendRealScreenFrame(int client_fd, int frame_id);
 
 int createServerSocket(int port);
+void printLocalIPv4Addresses(int port);
 int acceptClient(int server_fd);
 void screenSendLoop(int client_fd);
 void recvLoop(int client_fd);
 
 std::atomic<bool> g_running(true);
 
+const int SERVER_PORT = 9999;
+
 int main()
 {
     // ================================
     // 1. 创建监听 socket
     // ================================
-    int server_fd = createServerSocket(8080);
+    int server_fd = createServerSocket(SERVER_PORT);
 
-    std::cout << "server waiting..." << std::endl;
+    printLocalIPv4Addresses(SERVER_PORT);
+    std::cout << "server waiting on 0.0.0.0:" << SERVER_PORT << " ..." << std::endl;
 
     // ================================
     // 2. 等待 Windows 客户端连接
@@ -190,6 +196,60 @@ int createServerSocket(int port)
     listen(server_fd, 5);
 
     return server_fd;
+}
+
+void printLocalIPv4Addresses(int port)
+{
+    char hostname[NI_MAXHOST] = {0};
+    if (gethostname(hostname, sizeof(hostname)) != 0)
+    {
+        perror("gethostname");
+        return;
+    }
+
+    addrinfo hints = {};
+    hints.ai_family = AF_INET;
+    hints.ai_socktype = SOCK_STREAM;
+    hints.ai_protocol = IPPROTO_TCP;
+
+    addrinfo* result = nullptr;
+    int ret = getaddrinfo(hostname, nullptr, &hints, &result);
+    if (ret != 0)
+    {
+        std::cout << "getaddrinfo failed: " << gai_strerror(ret) << std::endl;
+        return;
+    }
+
+    std::vector<std::string> addresses;
+    for (addrinfo* item = result; item != nullptr; item = item->ai_next)
+    {
+        sockaddr_in* address = reinterpret_cast<sockaddr_in*>(item->ai_addr);
+        if (address->sin_addr.s_addr == htonl(INADDR_LOOPBACK))
+        {
+            continue;
+        }
+
+        char ip[INET_ADDRSTRLEN] = {0};
+        if (inet_ntop(AF_INET, &address->sin_addr, ip, sizeof(ip)) != nullptr &&
+            std::find(addresses.begin(), addresses.end(), ip) == addresses.end())
+        {
+            addresses.push_back(ip);
+        }
+    }
+
+    freeaddrinfo(result);
+
+    if (addresses.empty())
+    {
+        std::cout << "no available non-loopback IPv4 address found" << std::endl;
+        return;
+    }
+
+    std::cout << "available server IPv4 addresses:" << std::endl;
+    for (const std::string& ip : addresses)
+    {
+        std::cout << "  " << ip << ":" << port << std::endl;
+    }
 }
 
 // ================================

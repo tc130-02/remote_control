@@ -4,6 +4,7 @@
 #define NOMINMAX
 
 #include <winsock2.h>
+#include <ws2tcpip.h>
 #include <windows.h>
 #include <iostream>
 #include <cstring>
@@ -22,7 +23,7 @@
 
 #include "../common/packet.h"
 
-const int SERVER_PORT = 8081;
+const int SERVER_PORT = 9999;
 const int RECV_BUFFER_SIZE = 262144;
 const int MAX_SCREEN_SIZE = 100 * 1024 * 1024;
 
@@ -31,6 +32,7 @@ SOCKET g_client_socket = INVALID_SOCKET;
 std::atomic<bool> g_running(false);
 
 bool initServer(int port);
+void printLocalIPv4Addresses(int port);
 SOCKET acceptClient(SOCKET server_socket);
 void recvLoop(SOCKET client_socket);
 void screenSendLoop(SOCKET client_socket);
@@ -63,6 +65,7 @@ int main()
         return 1;
     }
 
+    printLocalIPv4Addresses(SERVER_PORT);
     std::cout << "windows server waiting on 0.0.0.0:" << SERVER_PORT << " ..." << std::endl;
 
     g_client_socket = acceptClient(g_server_socket);
@@ -149,6 +152,53 @@ bool initServer(int port)
     }
 
     return true;
+}
+
+void printLocalIPv4Addresses(int port)
+{
+    char hostname[NI_MAXHOST] = { 0 };
+    if (gethostname(hostname, sizeof(hostname)) == SOCKET_ERROR) {
+        std::cout << "gethostname failed: " << WSAGetLastError() << std::endl;
+        return;
+    }
+
+    addrinfo hints = {};
+    hints.ai_family = AF_INET;
+    hints.ai_socktype = SOCK_STREAM;
+    hints.ai_protocol = IPPROTO_TCP;
+
+    addrinfo* result = nullptr;
+    int ret = getaddrinfo(hostname, nullptr, &hints, &result);
+    if (ret != 0) {
+        std::cout << "getaddrinfo failed: " << ret << std::endl;
+        return;
+    }
+
+    std::vector<std::string> addresses;
+    for (addrinfo* item = result; item != nullptr; item = item->ai_next) {
+        sockaddr_in* address = reinterpret_cast<sockaddr_in*>(item->ai_addr);
+        if (address->sin_addr.s_addr == htonl(INADDR_LOOPBACK)) {
+            continue;
+        }
+
+        char ip[INET_ADDRSTRLEN] = { 0 };
+        if (inet_ntop(AF_INET, &address->sin_addr, ip, sizeof(ip)) != nullptr &&
+            std::find(addresses.begin(), addresses.end(), ip) == addresses.end()) {
+            addresses.push_back(ip);
+        }
+    }
+
+    freeaddrinfo(result);
+
+    if (addresses.empty()) {
+        std::cout << "no available non-loopback IPv4 address found" << std::endl;
+        return;
+    }
+
+    std::cout << "available server IPv4 addresses:" << std::endl;
+    for (const std::string& ip : addresses) {
+        std::cout << "  " << ip << ":" << port << std::endl;
+    }
 }
 
 SOCKET acceptClient(SOCKET server_socket)

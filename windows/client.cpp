@@ -4,10 +4,12 @@
 #define NOMINMAX
 
 #include <winsock2.h>
+#include <ws2tcpip.h>
 #include <windows.h>
 #include <iostream>
 #include <cstring>
 #include <string>
+#include <fstream>
 #include <cstdio>
 #include <cstdlib>
 #include <vector>
@@ -22,6 +24,8 @@
 SOCKET g_server_socket = INVALID_SOCKET;
 SOCKADDR_IN g_server_addr = {};
 HWND g_hwnd = NULL;
+
+const int SERVER_PORT = 9999;
 
 int g_remote_width = 1918;
 int g_remote_height = 918;
@@ -51,6 +55,7 @@ int g_frame_format = 0;
 bool g_receiving_frame = false;
 
 bool InitSocket();
+bool LoadServerAddress();
 bool ConnectServer();
 int InitWindow(HINSTANCE hInstance, int nCmdShow);
 
@@ -394,14 +399,63 @@ bool InitSocket()
     }
 
     g_server_addr.sin_family = AF_INET;
-    g_server_addr.sin_port = htons(8080);
-    g_server_addr.sin_addr.s_addr = inet_addr("[REMOVED_PRIVATE_IP]");
+    g_server_addr.sin_port = htons(SERVER_PORT);
 
+    return true;
+}
+
+bool LoadServerAddress()
+{
+    char executable_path[MAX_PATH] = { 0 };
+    DWORD path_length = GetModuleFileNameA(NULL, executable_path, MAX_PATH);
+    if (path_length == 0 || path_length >= MAX_PATH) {
+        std::cout << "failed to get program directory: " << GetLastError() << std::endl;
+        return false;
+    }
+
+    std::string config_path(executable_path, path_length);
+    size_t separator = config_path.find_last_of("\\/");
+    if (separator != std::string::npos) {
+        config_path.resize(separator + 1);
+    }
+    else {
+        config_path.clear();
+    }
+    config_path += "server.conf";
+
+    std::ifstream config(config_path);
+    if (!config.is_open()) {
+        std::cout << "server.conf not found: " << config_path << std::endl;
+        return false;
+    }
+
+    std::string server_ip;
+    std::getline(config, server_ip);
+    size_t first = server_ip.find_first_not_of(" \t\r\n");
+    size_t last = server_ip.find_last_not_of(" \t\r\n");
+    if (first == std::string::npos) {
+        std::cout << "server.conf is empty: " << config_path << std::endl;
+        return false;
+    }
+    server_ip = server_ip.substr(first, last - first + 1);
+
+    if (inet_pton(AF_INET, server_ip.c_str(), &g_server_addr.sin_addr) != 1) {
+        std::cout << "invalid IPv4 address in server.conf: " << server_ip << std::endl;
+        return false;
+    }
+
+    std::cout << "server address: " << server_ip << ":" << SERVER_PORT << std::endl;
     return true;
 }
 
 bool ConnectServer()
 {
+    if (!LoadServerAddress()) {
+        closesocket(g_server_socket);
+        g_server_socket = INVALID_SOCKET;
+        return false;
+    }
+
     int ret = connect(
         g_server_socket,
         (sockaddr*)&g_server_addr,

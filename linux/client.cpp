@@ -6,6 +6,9 @@
 #include <cstring>
 #include <cstdlib>
 #include <cstdio>
+#include <string>
+#include <fstream>
+#include <limits.h>
 #include <vector>
 #include <algorithm>
 
@@ -13,6 +16,8 @@
 #include <X11/Xutil.h>
 
 #include "../common/packet.h"
+
+const int SERVER_PORT = 9999;
 
 // ================================
 // 全局变量：屏幕帧接收状态
@@ -41,6 +46,7 @@ int g_window_height = 0;
 // ================================
 bool sendAll(int sock, const char* buf, int len);
 bool sendPacket(int sock, const Packet& pkt);
+bool loadServerAddress(sockaddr_in& server_addr);
 
 Packet buildPacket(int cmd, const char* msg);
 Packet buildRawPacket(int cmd, const char* buffer, int len);
@@ -80,12 +86,16 @@ int main()
     // 2. 配置 Windows server 地址
     // 说明：
     //   这里需要改成当前 Windows server 所在机器的 IP。
-    //   原来虚拟机 NAT 环境下可能是 [REMOVED_PRIVATE_IP]。
     // ================================
     sockaddr_in server_addr = {};
     server_addr.sin_family = AF_INET;
-    server_addr.sin_port = htons(8081);
-    server_addr.sin_addr.s_addr = inet_addr("[REMOVED_PRIVATE_IP]");
+    server_addr.sin_port = htons(SERVER_PORT);
+
+    if (!loadServerAddress(server_addr))
+    {
+        close(sock);
+        return 1;
+    }
 
     std::cout << "connecting to Windows server..." << std::endl;
 
@@ -136,6 +146,57 @@ int main()
     close(sock);
 
     return 0;
+}
+
+bool loadServerAddress(sockaddr_in& server_addr)
+{
+    char executable_path[PATH_MAX] = {0};
+    ssize_t path_length = readlink("/proc/self/exe", executable_path, sizeof(executable_path) - 1);
+    if (path_length < 0)
+    {
+        perror("failed to get program directory");
+        return false;
+    }
+    executable_path[path_length] = '\0';
+
+    std::string config_path(executable_path);
+    size_t separator = config_path.find_last_of('/');
+    if (separator != std::string::npos)
+    {
+        config_path.resize(separator + 1);
+    }
+    else
+    {
+        config_path.clear();
+    }
+    config_path += "server.conf";
+
+    std::ifstream config(config_path);
+    if (!config.is_open())
+    {
+        std::cout << "server.conf not found: " << config_path << std::endl;
+        return false;
+    }
+
+    std::string server_ip;
+    std::getline(config, server_ip);
+    size_t first = server_ip.find_first_not_of(" \t\r\n");
+    size_t last = server_ip.find_last_not_of(" \t\r\n");
+    if (first == std::string::npos)
+    {
+        std::cout << "server.conf is empty: " << config_path << std::endl;
+        return false;
+    }
+    server_ip = server_ip.substr(first, last - first + 1);
+
+    if (inet_pton(AF_INET, server_ip.c_str(), &server_addr.sin_addr) != 1)
+    {
+        std::cout << "invalid IPv4 address in server.conf: " << server_ip << std::endl;
+        return false;
+    }
+
+    std::cout << "server address: " << server_ip << ":" << SERVER_PORT << std::endl;
+    return true;
 }
 
 // ================================
