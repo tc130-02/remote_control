@@ -15,6 +15,7 @@
 #include <thread>
 #include <atomic>
 #include <chrono>
+#include <cerrno>
 #include <X11/extensions/XShm.h>
 #include <sys/ipc.h>
 #include <sys/shm.h>
@@ -45,6 +46,8 @@ void recvLoop(int client_fd);
 std::atomic<bool> g_running(true);
 
 const int SERVER_PORT = 9999;
+const useconds_t SCREEN_CHUNK_DELAY_US = 10000;
+const useconds_t SCREEN_FRAME_DELAY_US = 1000000;
 
 int main()
 {
@@ -282,8 +285,16 @@ void recvLoop(int client_fd)
 
         int len = recv(client_fd, buffer + offset, sizeof(buffer) - offset, 0);
 
-        if (len <= 0)
+        if (len == 0)
         {
+            std::cout << "client closed connection" << std::endl;
+            break;
+        }
+
+        if (len < 0)
+        {
+            std::cout << "recv failed: errno=" << errno
+                      << " message=" << strerror(errno) << std::endl;
             break;
         }
 
@@ -529,11 +540,24 @@ bool sendAll(int sock, const char *buf, int len)
 
     while (total < len)
     {
-        int n = send(sock, buf + total, len - total, 0);
+        int n = send(sock, buf + total, len - total, MSG_NOSIGNAL);
 
-        if (n <= 0)
+        if (n < 0)
         {
-            std::cout << "send failed" << std::endl;
+            std::cout << "send failed: errno=" << errno
+                      << " message=" << strerror(errno)
+                      << " sent=" << total
+                      << " packet_size=" << len
+                      << std::endl;
+            return false;
+        }
+
+        if (n == 0)
+        {
+            std::cout << "connection closed while sending"
+                      << " sent=" << total
+                      << " packet_size=" << len
+                      << std::endl;
             return false;
         }
 
@@ -768,6 +792,9 @@ void sendRealScreenFrame(int client_fd, int frame_id)
         return;
     }
 
+    std::cout << "screen begin sent frame=" << frame_id
+              << " size=" << total_size << std::endl;
+
     // ================================
     // 5. 分包发送图像数据
     // 每个包结构：
@@ -809,6 +836,17 @@ void sendRealScreenFrame(int client_fd, int frame_id)
 
         offset += data_len;
         chunk_count++;
+
+        if (chunk_count % 10 == 0 || offset == total_size)
+        {
+            std::cout << "screen chunk sent frame=" << frame_id
+                      << " chunks=" << chunk_count
+                      << " bytes=" << offset
+                      << "/" << total_size
+                      << std::endl;
+        }
+
+        usleep(SCREEN_CHUNK_DELAY_US);
     }
 
     // ================================
@@ -827,6 +865,9 @@ void sendRealScreenFrame(int client_fd, int frame_id)
         std::cout << "send screen end failed" << std::endl;
         return;
     }
+
+    std::cout << "screen end sent frame=" << frame_id
+              << " chunks=" << chunk_count << std::endl;
 
     auto t3 = std::chrono::steady_clock::now();
 
@@ -859,6 +900,6 @@ void screenSendLoop(int client_fd){
     {
         sendRealScreenFrame(client_fd, frame_id);
         frame_id++;
-        usleep(200000);
+        usleep(SCREEN_FRAME_DELAY_US);
     }
 }

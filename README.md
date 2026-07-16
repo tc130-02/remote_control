@@ -148,17 +148,31 @@ cmake --build windows/build
 ## 网络配置
 
 * Windows 和 Linux 服务端均监听所有本机 IPv4 网卡地址
-* TCP 端口统一为 `9999`
+* Windows 和 Linux 服务端默认监听 TCP `9999` 端口
 * 服务端启动后会打印本机可用的 IPv4 地址
 * 客户端从自身可执行文件所在目录读取 `server.conf`
 
-`server.conf` 只保存一行服务端 IPv4 地址，不要添加端口或其他配置。格式示例：
+Windows client 的 `server.conf` 保存两行配置：
 
 ```text
-192.0.2.10
+8.tcp.vip.cpolar.cn
+14320
 ```
 
-请将示例替换为服务端启动时实际打印的 IPv4 地址。配置文件不存在、内容为空或 IPv4 格式错误时，客户端会打印错误并停止连接。
+第一行支持 IPv4 地址或域名，第二行为 TCP 端口。例如局域网连接可配置为：
+
+```text
+192.168.1.10
+9999
+```
+
+Windows client 使用 `getaddrinfo()` 解析第一行，因此无需为公网域名重新编译客户端。配置文件不存在、主机名为空、端口缺失、端口无效或域名解析失败时，客户端会打印错误并停止连接。
+
+Linux client 当前仍使用一行 IPv4 地址，并连接固定 TCP `9999` 端口：
+
+```text
+192.168.1.10
+```
 
 `server.conf` 属于本机网络配置，已通过 `.gitignore` 忽略，请勿提交到代码仓库。
 
@@ -193,7 +207,12 @@ cd linux
 ./server
 ```
 
-2. 将 Linux server 打印的 IPv4 地址写入 `win_client.exe` 同目录下的 `server.conf`。
+2. 将 Linux server 地址和端口写入 `win_client.exe` 同目录下的 `server.conf`。局域网示例：
+
+```text
+192.168.1.10
+9999
+```
 
 3. 运行 Windows client：
 
@@ -202,7 +221,20 @@ cd windows/build
 .\win_client.exe
 ```
 
-如果连接失败，请确认服务端与客户端网络互通，并允许防火墙放行 TCP `9999` 端口。
+连接公网映射时，可在 Linux 端保持 server 监听 `9999`，再启动 TCP 隧道：
+
+```bash
+cpolar tcp 9999
+```
+
+假设 cpolar 返回 `8.tcp.vip.cpolar.cn:14320`，Windows client 的 `server.conf` 配置为：
+
+```text
+8.tcp.vip.cpolar.cn
+14320
+```
+
+如果连接失败，请确认域名可解析、映射端口正确、服务端与客户端网络互通，并允许防火墙放行对应 TCP 端口。
 
 ## 项目特点
 

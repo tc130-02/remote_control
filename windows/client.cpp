@@ -25,7 +25,7 @@ SOCKET g_server_socket = INVALID_SOCKET;
 SOCKADDR_IN g_server_addr = {};
 HWND g_hwnd = NULL;
 
-const int SERVER_PORT = 9999;
+int g_server_port = 9999;
 
 int g_remote_width = 1918;
 int g_remote_height = 918;
@@ -52,6 +52,7 @@ int g_frame_height = 0;
 int g_frame_total_size = 0;
 int g_frame_received_size = 0;
 int g_frame_format = 0;
+int g_frame_chunk_count = 0;
 bool g_receiving_frame = false;
 
 bool InitSocket();
@@ -398,9 +399,6 @@ bool InitSocket()
         return false;
     }
 
-    g_server_addr.sin_family = AF_INET;
-    g_server_addr.sin_port = htons(SERVER_PORT);
-
     return true;
 }
 
@@ -429,22 +427,71 @@ bool LoadServerAddress()
         return false;
     }
 
-    std::string server_ip;
-    std::getline(config, server_ip);
-    size_t first = server_ip.find_first_not_of(" \t\r\n");
-    size_t last = server_ip.find_last_not_of(" \t\r\n");
-    if (first == std::string::npos) {
+    auto trim = [](const std::string& value) {
+        size_t first = value.find_first_not_of(" \t\r\n");
+        if (first == std::string::npos) {
+            return std::string();
+        }
+
+        size_t last = value.find_last_not_of(" \t\r\n");
+        return value.substr(first, last - first + 1);
+    };
+
+    std::string server_host;
+    std::getline(config, server_host);
+    server_host = trim(server_host);
+    if (server_host.empty()) {
         std::cout << "server.conf is empty: " << config_path << std::endl;
         return false;
     }
-    server_ip = server_ip.substr(first, last - first + 1);
 
-    if (inet_pton(AF_INET, server_ip.c_str(), &g_server_addr.sin_addr) != 1) {
-        std::cout << "invalid IPv4 address in server.conf: " << server_ip << std::endl;
+    std::string server_port_text;
+    std::getline(config, server_port_text);
+    server_port_text = trim(server_port_text);
+    if (server_port_text.empty()) {
+        std::cout << "server port is missing in server.conf: " << config_path << std::endl;
         return false;
     }
 
-    std::cout << "server address: " << server_ip << ":" << SERVER_PORT << std::endl;
+    char* port_end = nullptr;
+    long server_port = std::strtol(server_port_text.c_str(), &port_end, 10);
+    if (port_end == server_port_text.c_str() || *port_end != '\0'
+        || server_port < 1 || server_port > 65535) {
+        std::cout << "invalid server port in server.conf: " << server_port_text << std::endl;
+        return false;
+    }
+    g_server_port = static_cast<int>(server_port);
+
+    addrinfo hints = {};
+    hints.ai_family = AF_INET;
+    hints.ai_socktype = SOCK_STREAM;
+    hints.ai_protocol = IPPROTO_TCP;
+
+    addrinfo* address_list = nullptr;
+    int resolve_result = getaddrinfo(
+        server_host.c_str(),
+        nullptr,
+        &hints,
+        &address_list
+    );
+
+    if (resolve_result != 0 || address_list == nullptr) {
+        std::cout << "resolve host failed: " << server_host;
+        if (resolve_result != 0) {
+            std::cout << " (" << resolve_result << ")";
+        }
+        std::cout << std::endl;
+        return false;
+    }
+
+    const sockaddr_in* resolved_address =
+        reinterpret_cast<const sockaddr_in*>(address_list->ai_addr);
+    g_server_addr.sin_family = AF_INET;
+    g_server_addr.sin_addr = resolved_address->sin_addr;
+    g_server_addr.sin_port = htons(g_server_port);
+    freeaddrinfo(address_list);
+
+    std::cout << "server address: " << server_host << ":" << g_server_port << std::endl;
     return true;
 }
 
@@ -686,10 +733,20 @@ void recvThreadProc()
     int offset = 0;
 
     while (g_running) {
+        if (offset >= (int)sizeof(buffer)) {
+            std::cout << "recv buffer full, protocol error" << std::endl;
+            break;
+        }
+
         int len = recv(g_server_socket, buffer + offset, sizeof(buffer) - offset, 0);
 
-        if (len <= 0) {
-            std::cout << "recv thread stopped" << std::endl;
+        if (len == 0) {
+            std::cout << "server closed connection" << std::endl;
+            break;
+        }
+
+        if (len == SOCKET_ERROR) {
+            std::cout << "recv failed: " << WSAGetLastError() << std::endl;
             break;
         }
 
@@ -722,12 +779,15 @@ void recvThreadProc()
             offset -= pack_size;
         }
 
-        if (offset >= (int)sizeof(buffer)) {
-            offset = 0;
-        }
     }
 
     g_running = false;
+
+    SOCKET disconnected_socket = g_server_socket;
+    g_server_socket = INVALID_SOCKET;
+    if (disconnected_socket != INVALID_SOCKET) {
+        closesocket(disconnected_socket);
+    }
 }
 
 void handleIncomingPacket(const Packet& pkt)
@@ -790,15 +850,16 @@ void handleScreenBegin(const Packet& pkt)
     g_frame_total_size = info.total_size;
     g_frame_received_size = 0;
     g_frame_format = info.format;
+    g_frame_chunk_count = 0;
     g_receiving_frame = true;
 
     g_frame_buffer.clear();
     g_frame_buffer.resize(g_frame_total_size);
 
-    std::cout << "screen begin frame=" << g_frame_id
-        << " " << g_frame_width
+    std::cout << "recv screen begin frame_id=" << g_frame_id
+        << " total_size=" << g_frame_total_size
+        << " resolution=" << g_frame_width
         << "x" << g_frame_height
-        << " size=" << g_frame_total_size
         << std::endl;
 }
 
@@ -826,7 +887,9 @@ void handleScreenChunk(const Packet& pkt)
         return;
     }
 
-    if (header.offset < 0 || header.offset + header.data_len > g_frame_total_size) {
+    if (header.offset < 0
+        || header.offset > g_frame_total_size
+        || header.data_len > g_frame_total_size - header.offset) {
         std::cout << "invalid screen chunk offset" << std::endl;
         return;
     }
@@ -843,6 +906,18 @@ void handleScreenChunk(const Packet& pkt)
     );
 
     g_frame_received_size += header.data_len;
+    g_frame_chunk_count++;
+
+    if (g_frame_chunk_count % 10 == 0
+        || header.offset + header.data_len == g_frame_total_size) {
+        std::cout << "recv screen chunk frame_id=" << header.frame_id
+            << " chunk=" << g_frame_chunk_count
+            << " offset=" << header.offset
+            << " len=" << header.data_len
+            << " received_size=" << g_frame_received_size
+            << "/" << g_frame_total_size
+            << std::endl;
+    }
 }
 
 void handleScreenEnd(const Packet& pkt)
@@ -855,7 +930,17 @@ void handleScreenEnd(const Packet& pkt)
     int end_frame_id = -1;
     memcpy(&end_frame_id, pkt.data, sizeof(int));
 
+    std::cout << "recv screen end frame_id=" << end_frame_id
+        << " received_size=" << g_frame_received_size
+        << " total_size=" << g_frame_total_size
+        << " chunks=" << g_frame_chunk_count
+        << std::endl;
+
     if (!g_receiving_frame || end_frame_id != g_frame_id) {
+        std::cout << "screen end frame mismatch current_frame_id="
+            << g_frame_id
+            << " receiving=" << g_receiving_frame
+            << std::endl;
         return;
     }
 

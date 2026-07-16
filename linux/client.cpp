@@ -3,6 +3,7 @@
 #include <arpa/inet.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
+#include <netdb.h>
 #include <cstring>
 #include <cstdlib>
 #include <cstdio>
@@ -17,7 +18,7 @@
 
 #include "../common/packet.h"
 
-const int SERVER_PORT = 9999;
+int g_server_port = 9999;
 
 // ================================
 // 全局变量：屏幕帧接收状态
@@ -88,8 +89,6 @@ int main()
     //   这里需要改成当前 Windows server 所在机器的 IP。
     // ================================
     sockaddr_in server_addr = {};
-    server_addr.sin_family = AF_INET;
-    server_addr.sin_port = htons(SERVER_PORT);
 
     if (!loadServerAddress(server_addr))
     {
@@ -178,24 +177,103 @@ bool loadServerAddress(sockaddr_in& server_addr)
         return false;
     }
 
-    std::string server_ip;
-    std::getline(config, server_ip);
-    size_t first = server_ip.find_first_not_of(" \t\r\n");
-    size_t last = server_ip.find_last_not_of(" \t\r\n");
-    if (first == std::string::npos)
+    auto trim = [](const std::string& value)
     {
-        std::cout << "server.conf is empty: " << config_path << std::endl;
+        size_t first = value.find_first_not_of(" \t\r\n");
+        if (first == std::string::npos)
+        {
+            return std::string();
+        }
+
+        size_t last = value.find_last_not_of(" \t\r\n");
+        return value.substr(first, last - first + 1);
+    };
+
+    std::string server_host;
+    std::string server_port_text;
+    std::string line;
+
+    while (std::getline(config, line))
+    {
+        line = trim(line);
+        if (line.empty())
+        {
+            continue;
+        }
+
+        size_t separator = line.find('=');
+        if (separator == std::string::npos)
+        {
+            continue;
+        }
+
+        std::string key = trim(line.substr(0, separator));
+        std::string value = trim(line.substr(separator + 1));
+
+        if (key == "ip")
+        {
+            server_host = value;
+        }
+        else if (key == "port")
+        {
+            server_port_text = value;
+        }
+    }
+
+    if (server_host.empty())
+    {
+        std::cout << "ip is missing in server.conf: " << config_path << std::endl;
         return false;
     }
-    server_ip = server_ip.substr(first, last - first + 1);
 
-    if (inet_pton(AF_INET, server_ip.c_str(), &server_addr.sin_addr) != 1)
+    if (server_port_text.empty())
     {
-        std::cout << "invalid IPv4 address in server.conf: " << server_ip << std::endl;
+        std::cout << "port is missing in server.conf: " << config_path << std::endl;
         return false;
     }
 
-    std::cout << "server address: " << server_ip << ":" << SERVER_PORT << std::endl;
+    char* port_end = nullptr;
+    long server_port = std::strtol(server_port_text.c_str(), &port_end, 10);
+    if (port_end == server_port_text.c_str() || *port_end != '\0'
+        || server_port < 1 || server_port > 65535)
+    {
+        std::cout << "invalid port in server.conf: " << server_port_text << std::endl;
+        return false;
+    }
+    g_server_port = static_cast<int>(server_port);
+
+    addrinfo hints = {};
+    hints.ai_family = AF_INET;
+    hints.ai_socktype = SOCK_STREAM;
+    hints.ai_protocol = IPPROTO_TCP;
+
+    addrinfo* address_list = nullptr;
+    int resolve_result = getaddrinfo(
+        server_host.c_str(),
+        nullptr,
+        &hints,
+        &address_list
+    );
+
+    if (resolve_result != 0 || address_list == nullptr)
+    {
+        std::cout << "resolve host failed: " << server_host;
+        if (resolve_result != 0)
+        {
+            std::cout << " (" << gai_strerror(resolve_result) << ")";
+        }
+        std::cout << std::endl;
+        return false;
+    }
+
+    const sockaddr_in* resolved_address =
+        reinterpret_cast<const sockaddr_in*>(address_list->ai_addr);
+    server_addr.sin_family = AF_INET;
+    server_addr.sin_addr = resolved_address->sin_addr;
+    server_addr.sin_port = htons(g_server_port);
+    freeaddrinfo(address_list);
+
+    std::cout << "server address: " << server_host << ":" << g_server_port << std::endl;
     return true;
 }
 
