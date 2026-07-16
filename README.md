@@ -2,9 +2,9 @@
 
 ## 项目简介
 
-本项目是一个用于学习和实践 C++ 网络编程、跨平台通信和桌面输入输出处理的实验性项目。项目基于 TCP Socket 自定义应用层协议，实现 Windows 与 Linux 之间的基础远程控制链路，包括消息封包、粘包/半包处理、键鼠事件传输以及屏幕帧分包回传。
+本项目是一个基于 C++ 实现的跨平台远程控制系统，支持 Windows 与 Linux 双端作为控制端或被控端运行。项目使用统一的 TCP 自定义应用层协议，实现远程屏幕传输、鼠标键盘事件传输、TCP 粘包/半包处理以及跨平台系统接口适配。
 
-本项目仅用于局域网学习、课程/求职项目展示和个人实验，不包含自启动、隐藏运行、权限提升、持久化驻留等功能。
+项目已完成局域网通信和基于 cpolar TCP 隧道的公网互通测试，用于学习和实践 C++ 网络编程、跨平台通信及桌面输入输出处理。当前未实现身份认证和加密传输，不应作为生产环境远程控制工具直接使用。
 
 ## 项目结构
 
@@ -26,7 +26,20 @@ remote_control/
 
 ## 当前功能
 
-### 1. 自定义 TCP 协议
+### 1. 已验证平台组合
+
+Windows/Linux 四端组合均已完成远程控制链路验证：
+
+| 控制端 | 被控端 | 验证结果 |
+| --- | --- | --- |
+| Windows Client | Windows Server | ✅ |
+| Windows Client | Linux Server | ✅ |
+| Linux Client | Windows Server | ✅ |
+| Linux Client | Linux Server | ✅ |
+
+测试覆盖局域网连接和通过 TCP 公网隧道进行的跨网络连接。公网测试用于验证域名解析、自定义端口和统一协议的跨网络可用性，不代表当前版本已经具备生产级安全能力。
+
+### 2. 自定义 TCP 协议
 
 项目使用统一的 Packet 协议格式：
 
@@ -43,7 +56,20 @@ magic | cmd | body_len | data
 
 服务端和客户端都实现了基于缓冲区的 TCP 粘包/半包处理逻辑，通过 `body_len` 判断一个完整业务包是否接收完成。
 
-### 2. Linux client 控制 Windows server
+### 3. 已实现功能
+
+* 基于 Windows WinSock 和 Linux POSIX Socket 的 TCP 通信
+* Windows/Linux 四端共享的自定义应用层协议
+* 由 `magic`、`cmd`、`body_len` 组成的逻辑 PacketHeader
+* 基于接收缓冲区和 `body_len` 的 TCP 粘包、半包处理
+* BGRA32 远程屏幕采集、分片传输、重组和缩放显示
+* 鼠标移动、点击、按下、抬起和双击事件传输
+* 键盘按下和抬起事件传输
+* Windows Win32 API、GDI 和 WinSock 接口适配
+* Linux POSIX Socket、X11 和 XShm 接口适配
+* IPv4、域名和自定义 TCP 端口配置
+
+### 4. Linux client 控制 Windows server
 
 当前已实现：
 
@@ -55,7 +81,7 @@ magic | cmd | body_len | data
 * Linux client 捕获窗口内鼠标点击事件并转发给 Windows
 * Linux client 支持键盘事件结构体发送
 
-### 3. Windows server 屏幕回传
+### 5. Windows server 屏幕回传
 
 Windows server 使用 Win32 GDI 进行屏幕采集：
 
@@ -72,7 +98,7 @@ Windows server 使用 Win32 GDI 进行屏幕采集：
 
 Linux client 接收完整一帧后进行重组和显示。
 
-### 4. Windows client 控制 Linux server
+### 6. Windows client 控制 Linux server
 
 当前已实现：
 
@@ -80,7 +106,7 @@ Linux client 接收完整一帧后进行重组和显示。
 * Linux server 使用 X11/XShm 采集并回传 Linux 屏幕帧
 * Windows client 显示远程屏幕并发送鼠标/键盘事件
 
-### 5. 键鼠事件传输
+### 7. 键鼠事件传输
 
 项目定义了统一的键鼠事件结构：
 
@@ -168,10 +194,11 @@ Windows client 的 `server.conf` 保存两行配置：
 
 Windows client 使用 `getaddrinfo()` 解析第一行，因此无需为公网域名重新编译客户端。配置文件不存在、主机名为空、端口缺失、端口无效或域名解析失败时，客户端会打印错误并停止连接。
 
-Linux client 当前仍使用一行 IPv4 地址，并连接固定 TCP `9999` 端口：
+Linux client 的 `server.conf` 使用键值格式，同样支持 IPv4、域名和自定义端口：
 
 ```text
-192.168.1.10
+ip=6.tcp.cpolar.top
+port=14826
 ```
 
 `server.conf` 属于本机网络配置，已通过 `.gitignore` 忽略，请勿提交到代码仓库。
@@ -187,7 +214,12 @@ cd windows/build
 .\win_server.exe
 ```
 
-2. 将 Windows server 打印的 IPv4 地址写入 Linux `client` 可执行文件同目录下的 `server.conf`。
+2. 将 Windows server 地址和端口写入 Linux `client` 可执行文件同目录下的 `server.conf`：
+
+```text
+ip=192.168.1.10
+port=9999
+```
 
 3. 在 Linux 端运行：
 
@@ -246,23 +278,36 @@ cpolar tcp 9999
 * Windows 端使用 Win32 API 实现屏幕采集和键鼠输入模拟
 * 支持远程屏幕缩放显示和坐标映射
 
+## 工程问题记录
+
+### TCP 无消息边界
+
+TCP 提供的是连续字节流，不保留应用层消息边界，一次 `send()` 的数据可能被拆分到多次 `recv()`，多次发送的数据也可能在一次接收中合并。项目通过固定包头中的 `body_len` 计算完整 Packet 长度，并使用接收缓冲区保留尚未处理完的数据。
+
+### 大屏幕数据分片传输
+
+原始 BGRA32 屏幕帧通常大于单个 Packet 的数据区。项目将一帧拆分为 `CMD_SCREEN_BEGIN`、多个 `CMD_SCREEN_CHUNK` 和 `CMD_SCREEN_END`，接收端根据帧编号、偏移量和总大小重组完整屏幕。
+
+### 跨平台接口适配
+
+Windows 和 Linux 在 Socket、屏幕采集、窗口显示及输入事件接口上存在差异。项目在保持统一通信协议的同时，分别使用 WinSock/Win32 API/GDI 和 POSIX Socket/X11/XShm 完成平台相关实现。
+
 ## 当前限制
 
-* 当前主要用于局域网环境测试
+* 已完成 TCP 公网隧道互通验证，但未实现生产级连接安全机制
 * 屏幕传输未做压缩，带宽占用较高
 * 鼠标移动暂未做节流优化
 * 键盘实时捕获功能仍可继续完善
 * 未实现身份认证和加密传输
-* 不适合作为公网远程控制工具使用
+* 不适合作为生产环境公网远程控制工具使用
 
 ## 后续计划
 
-* 增加鼠标移动节流，降低高频事件发送压力
-* 完善 Linux client 键盘实时输入捕获
-* 增加连接断开后的资源清理和重连机制
-* 加入简单身份验证
-* 优化屏幕传输性能，例如压缩或差分传输
-* 整理 Windows/Linux 四端统一编译和运行脚本
+* 增加屏幕压缩，降低公网传输带宽
+* 实现增量或差分屏幕传输
+* 增加身份认证和传输安全机制
+* 增加 GUI 配置界面，管理服务器地址、端口和连接状态
+* 继续完善连接断开后的资源清理与重连机制
 
 ## 说明
 
