@@ -16,16 +16,33 @@
 #include <thread>
 #include <mutex>
 #include <atomic>
+#include <algorithm>
 
 #pragma comment(lib, "ws2_32.lib")
 
 #include "../common/packet.h"
 
 SOCKET g_server_socket = INVALID_SOCKET;
-SOCKADDR_IN g_server_addr = {};
+SOCKET g_connect_socket = INVALID_SOCKET;
 HWND g_hwnd = NULL;
 
-int g_server_port = 9999;
+HWND g_host_label = NULL;
+HWND g_host_edit = NULL;
+HWND g_port_label = NULL;
+HWND g_port_edit = NULL;
+HWND g_connect_button = NULL;
+HWND g_status_static = NULL;
+
+const int IDC_HOST_EDIT = 1001;
+const int IDC_PORT_EDIT = 1002;
+const int IDC_CONNECT_BUTTON = 1003;
+const UINT WM_APP_CONNECT_COMPLETE = WM_APP + 1;
+const UINT WM_APP_CONNECTION_LOST = WM_APP + 2;
+
+std::string g_default_host;
+std::string g_default_port;
+std::string g_attempt_host;
+std::string g_attempt_port;
 
 int g_remote_width = 1918;
 int g_remote_height = 918;
@@ -38,7 +55,12 @@ bool g_use_mouse_down_up = false;
 bool g_use_new_key_event = true;
 
 std::atomic<bool> g_running(false);
+std::atomic<bool> g_connected(false);
+std::atomic<bool> g_connecting(false);
+std::atomic<bool> g_app_running(true);
 std::thread g_recv_thread;
+std::thread g_connect_thread;
+std::mutex g_socket_mutex;
 
 std::mutex g_screen_mutex;
 std::vector<unsigned char> g_screen_bgra;
@@ -56,8 +78,15 @@ int g_frame_chunk_count = 0;
 bool g_receiving_frame = false;
 
 bool InitSocket();
-bool LoadServerAddress();
-bool ConnectServer();
+std::string GetServerConfigPath();
+void LoadServerConfig(std::string& host, std::string& port);
+bool SaveServerConfig(const std::string& host, const std::string& port);
+bool ValidatePort(const std::string& port_text);
+void StartConnect();
+void ConnectWorker(std::string host, std::string port);
+void SetConnectionUiVisible(bool visible);
+void SetConnectionStatus(const std::string& status);
+void ResetRemoteScreenState();
 int InitWindow(HINSTANCE hInstance, int nCmdShow);
 
 bool convertToRemotePoint(HWND hwnd, int xPos, int yPos, int& remote_x, int& remote_y);
@@ -75,7 +104,7 @@ void sendKeyEvent(SOCKET sock, int key_status, const char* key);
 
 void sendKeyPressOld(SOCKET sock, const char* key);
 
-void recvThreadProc();
+void recvThreadProc(SOCKET connected_socket);
 void handleIncomingPacket(const Packet& pkt);
 void handleScreenBegin(const Packet& pkt);
 void handleScreenChunk(const Packet& pkt);
@@ -89,6 +118,140 @@ LRESULT CALLBACK winProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 {
     switch (msg)
     {
+    case WM_CREATE:
+    {
+        HINSTANCE instance = (HINSTANCE)GetWindowLongPtr(hwnd, GWLP_HINSTANCE);
+
+        g_host_label = CreateWindowA(
+            "STATIC", "Server address:",
+            WS_CHILD | WS_VISIBLE,
+            40, 70, 110, 24,
+            hwnd, NULL, instance, NULL
+        );
+        g_host_edit = CreateWindowExA(
+            WS_EX_CLIENTEDGE, "EDIT", g_default_host.c_str(),
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL,
+            155, 66, 340, 28,
+            hwnd, (HMENU)(INT_PTR)IDC_HOST_EDIT, instance, NULL
+        );
+        g_port_label = CreateWindowA(
+            "STATIC", "Port:",
+            WS_CHILD | WS_VISIBLE,
+            40, 112, 110, 24,
+            hwnd, NULL, instance, NULL
+        );
+        g_port_edit = CreateWindowExA(
+            WS_EX_CLIENTEDGE, "EDIT", g_default_port.c_str(),
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL,
+            155, 108, 140, 28,
+            hwnd, (HMENU)(INT_PTR)IDC_PORT_EDIT, instance, NULL
+        );
+        g_connect_button = CreateWindowA(
+            "BUTTON", "Connect",
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_DEFPUSHBUTTON,
+            315, 107, 180, 30,
+            hwnd, (HMENU)(INT_PTR)IDC_CONNECT_BUTTON, instance, NULL
+        );
+        g_status_static = CreateWindowA(
+            "STATIC", "waiting",
+            WS_CHILD | WS_VISIBLE,
+            40, 158, 700, 28,
+            hwnd, NULL, instance, NULL
+        );
+
+        HFONT font = (HFONT)GetStockObject(DEFAULT_GUI_FONT);
+        SendMessage(g_host_label, WM_SETFONT, (WPARAM)font, TRUE);
+        SendMessage(g_host_edit, WM_SETFONT, (WPARAM)font, TRUE);
+        SendMessage(g_port_label, WM_SETFONT, (WPARAM)font, TRUE);
+        SendMessage(g_port_edit, WM_SETFONT, (WPARAM)font, TRUE);
+        SendMessage(g_connect_button, WM_SETFONT, (WPARAM)font, TRUE);
+        SendMessage(g_status_static, WM_SETFONT, (WPARAM)font, TRUE);
+
+        SetFocus(g_host_edit);
+    }
+    break;
+
+    case WM_COMMAND:
+        if (LOWORD(wParam) == IDC_CONNECT_BUTTON
+            && HIWORD(wParam) == BN_CLICKED) {
+            StartConnect();
+        }
+        break;
+
+    case WM_APP_CONNECT_COMPLETE:
+    {
+        if (g_connect_thread.joinable()) {
+            g_connect_thread.join();
+        }
+
+        g_connecting = false;
+
+        if (wParam != 0) {
+            g_connected = true;
+            SetConnectionStatus("connected");
+            SetWindowTextA(
+                hwnd,
+                ("Remote Control - connected to "
+                    + g_attempt_host + ":" + g_attempt_port).c_str()
+            );
+            SaveServerConfig(g_attempt_host, g_attempt_port);
+            SetConnectionUiVisible(false);
+
+            SOCKET connected_socket = INVALID_SOCKET;
+            {
+                std::lock_guard<std::mutex> lock(g_socket_mutex);
+                connected_socket = g_server_socket;
+            }
+
+            if (connected_socket != INVALID_SOCKET) {
+                sendHello(connected_socket, "hello linux window client");
+                g_running = true;
+                g_recv_thread = std::thread(
+                    recvThreadProc,
+                    connected_socket
+                );
+            }
+        }
+        else {
+            int error_code = (int)lParam;
+            SetConnectionStatus(
+                "connect failed, WSA error=" + std::to_string(error_code)
+            );
+            EnableWindow(g_connect_button, TRUE);
+            SetFocus(g_host_edit);
+        }
+    }
+    break;
+
+    case WM_APP_CONNECTION_LOST:
+    {
+        if (g_recv_thread.joinable()) {
+            g_recv_thread.join();
+        }
+
+        g_running = false;
+        g_connected = false;
+        ResetRemoteScreenState();
+        SetWindowTextA(hwnd, "Remote Control Client");
+        SetConnectionUiVisible(true);
+        EnableWindow(g_connect_button, TRUE);
+
+        int error_code = (int)wParam;
+        if (error_code != 0) {
+            SetConnectionStatus(
+                "waiting - disconnected, WSA error="
+                + std::to_string(error_code)
+            );
+        }
+        else {
+            SetConnectionStatus("waiting - disconnected");
+        }
+
+        InvalidateRect(hwnd, NULL, TRUE);
+        SetFocus(g_host_edit);
+    }
+    break;
+
     case WM_PAINT:
     {
         PAINTSTRUCT ps;
@@ -97,7 +260,14 @@ LRESULT CALLBACK winProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
         RECT client_rect;
         GetClientRect(hwnd, &client_rect);
 
-        drawRemoteScreen(hdc, client_rect);
+        if (g_connected) {
+            drawRemoteScreen(hdc, client_rect);
+        }
+        else {
+            FillRect(hdc, &client_rect, (HBRUSH)(COLOR_WINDOW + 1));
+            const char* title = "Remote Control Connection";
+            TextOutA(hdc, 40, 28, title, (int)strlen(title));
+        }
 
         EndPaint(hwnd, &ps);
     }
@@ -273,12 +443,28 @@ LRESULT CALLBACK winProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 
     case WM_DESTROY:
     {
+        g_app_running = false;
         g_running = false;
+        g_connected = false;
 
-        if (g_server_socket != INVALID_SOCKET) {
-            shutdown(g_server_socket, SD_BOTH);
-            closesocket(g_server_socket);
-            g_server_socket = INVALID_SOCKET;
+        {
+            std::lock_guard<std::mutex> lock(g_socket_mutex);
+
+            if (g_connect_socket != INVALID_SOCKET) {
+                shutdown(g_connect_socket, SD_BOTH);
+                closesocket(g_connect_socket);
+                g_connect_socket = INVALID_SOCKET;
+            }
+
+            if (g_server_socket != INVALID_SOCKET) {
+                shutdown(g_server_socket, SD_BOTH);
+                closesocket(g_server_socket);
+                g_server_socket = INVALID_SOCKET;
+            }
+        }
+
+        if (g_connect_thread.joinable()) {
+            g_connect_thread.join();
         }
 
         if (g_recv_thread.joinable()) {
@@ -313,21 +499,12 @@ int WINAPI WinMain(
         return 0;
     }
 
-    if (!ConnectServer()) {
-        MessageBoxA(NULL, "Connect Linux server failed", "error", MB_OK | MB_ICONERROR);
-        WSACleanup();
-        return 0;
-    }
+    LoadServerConfig(g_default_host, g_default_port);
 
     if (!InitWindow(hInstance, nCmdShow)) {
         WSACleanup();
         return 0;
     }
-
-    sendHello(g_server_socket, "hello linux window client");
-
-    g_running = true;
-    g_recv_thread = std::thread(recvThreadProc);
 
     MSG msg = { 0 };
 
@@ -358,7 +535,7 @@ int InitWindow(HINSTANCE hInstance, int nCmdShow)
 
     g_hwnd = CreateWindowA(
         CLASS_NAME,
-        "Windows to Linux Remote Control",
+        "Remote Control Client",
         WS_OVERLAPPEDWINDOW,
         CW_USEDEFAULT,
         CW_USEDEFAULT,
@@ -391,24 +568,16 @@ bool InitSocket()
         return false;
     }
 
-    g_server_socket = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-
-    if (g_server_socket == INVALID_SOCKET) {
-        std::cout << "socket failed: " << WSAGetLastError() << std::endl;
-        WSACleanup();
-        return false;
-    }
-
     return true;
 }
 
-bool LoadServerAddress()
+std::string GetServerConfigPath()
 {
     char executable_path[MAX_PATH] = { 0 };
     DWORD path_length = GetModuleFileNameA(NULL, executable_path, MAX_PATH);
     if (path_length == 0 || path_length >= MAX_PATH) {
         std::cout << "failed to get program directory: " << GetLastError() << std::endl;
-        return false;
+        return "";
     }
 
     std::string config_path(executable_path, path_length);
@@ -420,11 +589,22 @@ bool LoadServerAddress()
         config_path.clear();
     }
     config_path += "server.conf";
+    return config_path;
+}
+
+void LoadServerConfig(std::string& host, std::string& port)
+{
+    host.clear();
+    port.clear();
+
+    std::string config_path = GetServerConfigPath();
+    if (config_path.empty()) {
+        return;
+    }
 
     std::ifstream config(config_path);
     if (!config.is_open()) {
-        std::cout << "server.conf not found: " << config_path << std::endl;
-        return false;
+        return;
     }
 
     auto trim = [](const std::string& value) {
@@ -437,31 +617,131 @@ bool LoadServerAddress()
         return value.substr(first, last - first + 1);
     };
 
-    std::string server_host;
-    std::getline(config, server_host);
-    server_host = trim(server_host);
-    if (server_host.empty()) {
-        std::cout << "server.conf is empty: " << config_path << std::endl;
+    std::getline(config, host);
+    std::getline(config, port);
+    host = trim(host);
+    port = trim(port);
+
+    if (!ValidatePort(port)) {
+        port.clear();
+    }
+}
+
+bool SaveServerConfig(const std::string& host, const std::string& port)
+{
+    std::string config_path = GetServerConfigPath();
+    if (config_path.empty()) {
         return false;
     }
 
-    std::string server_port_text;
-    std::getline(config, server_port_text);
-    server_port_text = trim(server_port_text);
-    if (server_port_text.empty()) {
-        std::cout << "server port is missing in server.conf: " << config_path << std::endl;
+    std::ofstream config(config_path, std::ios::trunc);
+    if (!config.is_open()) {
+        std::cout << "failed to save server.conf: " << config_path << std::endl;
+        return false;
+    }
+
+    config << host << "\n" << port << "\n";
+    return config.good();
+}
+
+bool ValidatePort(const std::string& port_text)
+{
+    if (port_text.empty()) {
         return false;
     }
 
     char* port_end = nullptr;
-    long server_port = std::strtol(server_port_text.c_str(), &port_end, 10);
-    if (port_end == server_port_text.c_str() || *port_end != '\0'
-        || server_port < 1 || server_port > 65535) {
-        std::cout << "invalid server port in server.conf: " << server_port_text << std::endl;
-        return false;
-    }
-    g_server_port = static_cast<int>(server_port);
+    long port = std::strtol(port_text.c_str(), &port_end, 10);
+    return port_end != port_text.c_str()
+        && *port_end == '\0'
+        && port >= 1
+        && port <= 65535;
+}
 
+void SetConnectionStatus(const std::string& status)
+{
+    if (g_status_static != NULL) {
+        SetWindowTextA(g_status_static, status.c_str());
+    }
+}
+
+void SetConnectionUiVisible(bool visible)
+{
+    int command = visible ? SW_SHOW : SW_HIDE;
+    ShowWindow(g_host_label, command);
+    ShowWindow(g_host_edit, command);
+    ShowWindow(g_port_label, command);
+    ShowWindow(g_port_edit, command);
+    ShowWindow(g_connect_button, command);
+    ShowWindow(g_status_static, command);
+}
+
+void ResetRemoteScreenState()
+{
+    std::lock_guard<std::mutex> lock(g_screen_mutex);
+    g_screen_bgra.clear();
+    g_screen_width = 0;
+    g_screen_height = 0;
+    g_frame_buffer.clear();
+    g_frame_id = -1;
+    g_frame_width = 0;
+    g_frame_height = 0;
+    g_frame_total_size = 0;
+    g_frame_received_size = 0;
+    g_frame_chunk_count = 0;
+    g_receiving_frame = false;
+}
+
+void StartConnect()
+{
+    if (g_connecting || g_connected || !g_app_running) {
+        return;
+    }
+
+    char host_buffer[512] = { 0 };
+    char port_buffer[32] = { 0 };
+    GetWindowTextA(g_host_edit, host_buffer, sizeof(host_buffer));
+    GetWindowTextA(g_port_edit, port_buffer, sizeof(port_buffer));
+
+    auto trim = [](const std::string& value) {
+        size_t first = value.find_first_not_of(" \t\r\n");
+        if (first == std::string::npos) {
+            return std::string();
+        }
+        size_t last = value.find_last_not_of(" \t\r\n");
+        return value.substr(first, last - first + 1);
+    };
+
+    std::string host = trim(host_buffer);
+    std::string port = trim(port_buffer);
+
+    if (host.empty()) {
+        SetConnectionStatus("connect failed: server address is empty");
+        SetFocus(g_host_edit);
+        return;
+    }
+
+    if (!ValidatePort(port)) {
+        SetConnectionStatus("connect failed: port must be 1-65535");
+        SetFocus(g_port_edit);
+        return;
+    }
+
+    if (g_connect_thread.joinable()) {
+        g_connect_thread.join();
+    }
+
+    g_attempt_host = host;
+    g_attempt_port = port;
+    g_connecting = true;
+    EnableWindow(g_connect_button, FALSE);
+    SetConnectionStatus("connecting");
+
+    g_connect_thread = std::thread(ConnectWorker, host, port);
+}
+
+void ConnectWorker(std::string host, std::string port)
+{
     addrinfo hints = {};
     hints.ai_family = AF_INET;
     hints.ai_socktype = SOCK_STREAM;
@@ -469,56 +749,91 @@ bool LoadServerAddress()
 
     addrinfo* address_list = nullptr;
     int resolve_result = getaddrinfo(
-        server_host.c_str(),
-        nullptr,
+        host.c_str(),
+        port.c_str(),
         &hints,
         &address_list
     );
 
     if (resolve_result != 0 || address_list == nullptr) {
-        std::cout << "resolve host failed: " << server_host;
-        if (resolve_result != 0) {
-            std::cout << " (" << resolve_result << ")";
-        }
-        std::cout << std::endl;
-        return false;
+        PostMessage(
+            g_hwnd,
+            WM_APP_CONNECT_COMPLETE,
+            FALSE,
+            (LPARAM)resolve_result
+        );
+        return;
     }
 
-    const sockaddr_in* resolved_address =
-        reinterpret_cast<const sockaddr_in*>(address_list->ai_addr);
-    g_server_addr.sin_family = AF_INET;
-    g_server_addr.sin_addr = resolved_address->sin_addr;
-    g_server_addr.sin_port = htons(g_server_port);
+    SOCKET connected_socket = INVALID_SOCKET;
+    int last_error = WSAHOST_NOT_FOUND;
+
+    for (addrinfo* item = address_list;
+         item != nullptr && g_app_running;
+         item = item->ai_next) {
+        SOCKET attempt_socket = socket(
+            item->ai_family,
+            item->ai_socktype,
+            item->ai_protocol
+        );
+
+        if (attempt_socket == INVALID_SOCKET) {
+            last_error = WSAGetLastError();
+            continue;
+        }
+
+        {
+            std::lock_guard<std::mutex> lock(g_socket_mutex);
+            if (!g_app_running) {
+                closesocket(attempt_socket);
+                break;
+            }
+            g_connect_socket = attempt_socket;
+        }
+
+        int connect_result = connect(
+            attempt_socket,
+            item->ai_addr,
+            (int)item->ai_addrlen
+        );
+
+        bool still_owned = false;
+        {
+            std::lock_guard<std::mutex> lock(g_socket_mutex);
+            if (g_connect_socket == attempt_socket) {
+                g_connect_socket = INVALID_SOCKET;
+                still_owned = true;
+            }
+        }
+
+        if (connect_result == 0 && still_owned && g_app_running) {
+            connected_socket = attempt_socket;
+            break;
+        }
+
+        last_error = WSAGetLastError();
+        if (still_owned) {
+            closesocket(attempt_socket);
+        }
+    }
+
     freeaddrinfo(address_list);
 
-    std::cout << "server address: " << server_host << ":" << g_server_port << std::endl;
-    return true;
-}
-
-bool ConnectServer()
-{
-    if (!LoadServerAddress()) {
-        closesocket(g_server_socket);
-        g_server_socket = INVALID_SOCKET;
-        return false;
-    }
-
-    int ret = connect(
-        g_server_socket,
-        (sockaddr*)&g_server_addr,
-        sizeof(g_server_addr)
-    );
-
-    if (ret == SOCKET_ERROR) {
-        std::cout << "connect failed: " << WSAGetLastError() << std::endl;
-        closesocket(g_server_socket);
-        g_server_socket = INVALID_SOCKET;
-        return false;
+    if (connected_socket == INVALID_SOCKET) {
+        if (g_app_running) {
+            PostMessage(
+                g_hwnd,
+                WM_APP_CONNECT_COMPLETE,
+                FALSE,
+                (LPARAM)last_error
+            );
+        }
+        return;
     }
 
     BOOL no_delay = TRUE;
     if (setsockopt(
-            g_server_socket,
+            connected_socket,
             IPPROTO_TCP,
             TCP_NODELAY,
             (const char*)&no_delay,
@@ -527,8 +842,16 @@ bool ConnectServer()
         std::cout << "set TCP_NODELAY failed: " << WSAGetLastError() << std::endl;
     }
 
-    std::cout << "connect success!" << std::endl;
-    return true;
+    {
+        std::lock_guard<std::mutex> lock(g_socket_mutex);
+        if (!g_app_running) {
+            closesocket(connected_socket);
+            return;
+        }
+        g_server_socket = connected_socket;
+    }
+
+    PostMessage(g_hwnd, WM_APP_CONNECT_COMPLETE, TRUE, 0);
 }
 
 bool convertToRemotePoint(HWND hwnd, int xPos, int yPos, int& remote_x, int& remote_y)
@@ -738,10 +1061,11 @@ void sendKeyPressOld(SOCKET sock, const char* key)
     std::cout << "send old key press: " << key << std::endl;
 }
 
-void recvThreadProc()
+void recvThreadProc(SOCKET connected_socket)
 {
     char buffer[262144] = { 0 };
     int offset = 0;
+    int disconnect_error = 0;
 
     while (g_running) {
         if (offset >= (int)sizeof(buffer)) {
@@ -749,7 +1073,12 @@ void recvThreadProc()
             break;
         }
 
-        int len = recv(g_server_socket, buffer + offset, sizeof(buffer) - offset, 0);
+        int len = recv(
+            connected_socket,
+            buffer + offset,
+            sizeof(buffer) - offset,
+            0
+        );
 
         if (len == 0) {
             std::cout << "server closed connection" << std::endl;
@@ -757,7 +1086,8 @@ void recvThreadProc()
         }
 
         if (len == SOCKET_ERROR) {
-            std::cout << "recv failed: " << WSAGetLastError() << std::endl;
+            disconnect_error = WSAGetLastError();
+            std::cout << "recv failed: " << disconnect_error << std::endl;
             break;
         }
 
@@ -793,11 +1123,28 @@ void recvThreadProc()
     }
 
     g_running = false;
+    g_connected = false;
 
-    SOCKET disconnected_socket = g_server_socket;
-    g_server_socket = INVALID_SOCKET;
-    if (disconnected_socket != INVALID_SOCKET) {
-        closesocket(disconnected_socket);
+    bool should_close = false;
+    {
+        std::lock_guard<std::mutex> lock(g_socket_mutex);
+        if (g_server_socket == connected_socket) {
+            g_server_socket = INVALID_SOCKET;
+            should_close = true;
+        }
+    }
+
+    if (should_close) {
+        closesocket(connected_socket);
+    }
+
+    if (g_app_running) {
+        PostMessage(
+            g_hwnd,
+            WM_APP_CONNECTION_LOST,
+            (WPARAM)disconnect_error,
+            0
+        );
     }
 }
 

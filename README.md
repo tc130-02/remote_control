@@ -151,7 +151,7 @@ sudo apt install build-essential libx11-dev libxext-dev
 
 ```bash
 cd linux
-g++ client.cpp -o client -lX11
+g++ client.cpp -o client -lX11 -pthread
 g++ server.cpp -o server -lX11 -lXext -pthread
 ```
 
@@ -176,7 +176,9 @@ cmake --build windows/build
 * Windows 和 Linux 服务端均监听所有本机 IPv4 网卡地址
 * Windows 和 Linux 服务端默认监听 TCP `9999` 端口
 * 服务端启动后会打印本机可用的 IPv4 地址
-* 客户端从自身可执行文件所在目录读取 `server.conf`
+* 客户端启动后在连接界面中输入服务端地址和端口
+* 客户端会从自身可执行文件所在目录读取 `server.conf` 作为默认值
+* 连接成功后会把本次地址和端口保存回 `server.conf`
 
 Windows client 的 `server.conf` 保存两行配置：
 
@@ -192,7 +194,7 @@ Windows client 的 `server.conf` 保存两行配置：
 9999
 ```
 
-Windows client 使用 `getaddrinfo()` 解析第一行，因此无需为公网域名重新编译客户端。配置文件不存在、主机名为空、端口缺失、端口无效或域名解析失败时，客户端会打印错误并停止连接。
+Windows client 使用 `getaddrinfo()` 解析连接界面中的地址。`server.conf` 不存在或内容无效时输入框保持为空，用户可以直接输入 IPv4 地址或域名。端口范围为 `1～65535`。连接过程在后台线程执行，不阻塞 Win32 窗口；连接失败后会显示 WinSock 错误码并允许重新输入。
 
 Linux client 的 `server.conf` 使用键值格式，同样支持 IPv4、域名和自定义端口：
 
@@ -202,6 +204,8 @@ port=14826
 ```
 
 `server.conf` 属于本机网络配置，已通过 `.gitignore` 忽略，请勿提交到代码仓库。
+
+Linux client 使用现有 X11 窗口显示 host、port 输入框、连接按钮和状态栏。可用鼠标切换输入框，使用普通字符和 Backspace 编辑，按 Enter 或点击 Connect 开始异步连接。连接失败时会显示 `errno` 或 `gai_strerror()` 信息。
 
 ## 运行方式
 
@@ -214,21 +218,21 @@ cd windows/build
 .\win_server.exe
 ```
 
-2. 将 Windows server 地址和端口写入 Linux `client` 可执行文件同目录下的 `server.conf`：
-
-```text
-ip=192.168.1.10
-port=9999
-```
-
-3. 在 Linux 端运行：
+2. 在 Linux 端运行：
 
 ```bash
 cd linux
 ./client
 ```
 
-连接成功后，Linux client 会显示 Windows 屏幕，并支持在显示窗口内移动和点击鼠标来控制 Windows。
+也可以通过命令行给出连接界面的默认值：
+
+```bash
+./client 192.168.1.10 9999
+./client 8.tcp.vip.cpolar.cn 14320
+```
+
+Linux client 始终先显示 X11 连接界面。确认或修改 host 和 port 后按 Enter 或点击 Connect。连接成功后切换到远程屏幕显示；连接断开后自动返回连接界面。
 
 ### Windows client 连接 Linux server
 
@@ -239,19 +243,14 @@ cd linux
 ./server
 ```
 
-2. 将 Linux server 地址和端口写入 `win_client.exe` 同目录下的 `server.conf`。局域网示例：
-
-```text
-192.168.1.10
-9999
-```
-
-3. 运行 Windows client：
+2. 运行 Windows client：
 
 ```powershell
 cd windows/build
 .\win_client.exe
 ```
+
+在 Win32 连接界面输入 Linux server 的 IPv4 地址或域名以及端口，然后点击 Connect。状态文字会显示 waiting、connecting、连接失败信息；连接成功后隐藏输入控件并进入远程屏幕。断线后会自动返回连接界面。
 
 连接公网映射时，可在 Linux 端保持 server 监听 `9999`，再启动 TCP 隧道：
 
@@ -259,12 +258,7 @@ cd windows/build
 cpolar tcp 9999
 ```
 
-假设 cpolar 返回 `8.tcp.vip.cpolar.cn:14320`，Windows client 的 `server.conf` 配置为：
-
-```text
-8.tcp.vip.cpolar.cn
-14320
-```
+假设 cpolar 返回 `8.tcp.vip.cpolar.cn:14320`，可直接在 Windows 或 Linux client 的连接界面输入该域名和端口。
 
 如果连接失败，请确认域名可解析、映射端口正确、服务端与客户端网络互通，并允许防火墙放行对应 TCP 端口。
 

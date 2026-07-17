@@ -16,13 +16,15 @@
 #include <vector>
 #include <algorithm>
 #include <chrono>
+#include <thread>
+#include <mutex>
+#include <atomic>
 
 #include <X11/Xlib.h>
 #include <X11/Xutil.h>
+#include <X11/keysym.h>
 
 #include "../common/packet.h"
-
-int g_server_port = 9999;
 
 // ================================
 // 全局变量：屏幕帧接收状态
@@ -45,6 +47,47 @@ GC g_gc = 0;
 
 int g_window_width = 0;
 int g_window_height = 0;
+int g_configured_remote_width = 0;
+int g_configured_remote_height = 0;
+Atom g_wm_delete_window = None;
+
+enum class ClientState
+{
+    WAITING,
+    CONNECTING,
+    CONNECTED,
+    FAILED
+};
+
+ClientState g_client_state = ClientState::WAITING;
+std::atomic<bool> g_app_running(true);
+std::atomic<bool> g_connecting(false);
+std::thread g_connect_thread;
+std::mutex g_connect_mutex;
+int g_pending_connect_socket = -1;
+int g_connect_result_socket = -1;
+bool g_connect_result_ready = false;
+std::string g_connect_result_error;
+
+std::string g_host_input;
+std::string g_port_input;
+std::string g_connection_status = "waiting";
+int g_active_input = 1;
+
+const int CONNECTION_WINDOW_WIDTH = 640;
+const int CONNECTION_WINDOW_HEIGHT = 300;
+const int HOST_X = 145;
+const int HOST_Y = 65;
+const int HOST_WIDTH = 430;
+const int HOST_HEIGHT = 34;
+const int PORT_X = 145;
+const int PORT_Y = 120;
+const int PORT_WIDTH = 180;
+const int PORT_HEIGHT = 34;
+const int CONNECT_X = 365;
+const int CONNECT_Y = 175;
+const int CONNECT_WIDTH = 210;
+const int CONNECT_HEIGHT = 40;
 
 bool g_mouse_move_pending = false;
 int g_pending_mouse_x = 0;
@@ -57,7 +100,14 @@ std::chrono::steady_clock::time_point g_last_mouse_send_time =
 // ================================
 bool sendAll(int sock, const char* buf, int len);
 bool sendPacket(int sock, const Packet& pkt);
-bool loadServerAddress(sockaddr_in& server_addr);
+std::string getServerConfigPath();
+void loadServerConfig(std::string& host, std::string& port);
+bool saveServerConfig(const std::string& host, const std::string& port);
+bool validatePort(const std::string& port);
+void beginAsyncConnect();
+void connectWorker(std::string host, std::string port);
+bool pollConnectResult(int& connected_socket);
+void cancelConnectThread();
 
 Packet buildPacket(int cmd, const char* msg);
 Packet buildRawPacket(int cmd, const char* buffer, int len);
@@ -68,9 +118,13 @@ void sendKeyClick(int sock, const char* key);
 void sendMouseEvent(int sock, int action, int button, int x, int y);
 bool convertLocalToRemote(int local_x, int local_y, int& remote_x, int& remote_y);
 void handleX11Events(int sock);
+void handleConnectionEvent(const XEvent& event);
 
+bool initConnectionWindow();
 bool initDisplayWindow(int width, int height);
+void drawConnectionInterface();
 void drawFrameToWindow();
+void resetRemoteState();
 void closeDisplayWindow();
 
 void handleScreenBegin(const Packet& pkt);
@@ -80,106 +134,109 @@ void handleScreenEnd(const Packet& pkt);
 void handlePacket(const Packet& pkt);
 void recvLoop(int sock);
 
-int main()
+int main(int argc, char* argv[])
 {
-    // ================================
-    // 1. 创建 socket
-    // ================================
-    int sock = socket(AF_INET, SOCK_STREAM, 0);
+    loadServerConfig(g_host_input, g_port_input);
 
-    if (sock < 0)
+    if (argc >= 3)
     {
-        perror("socket");
+        g_host_input = argv[1];
+        g_port_input = argv[2];
+    }
+
+    if (!initConnectionWindow())
+    {
         return 1;
     }
 
-    // ================================
-    // 2. 配置 Windows server 地址
-    // 说明：
-    //   这里需要改成当前 Windows server 所在机器的 IP。
-    // ================================
-    sockaddr_in server_addr = {};
+    int sock = -1;
 
-    if (!loadServerAddress(server_addr))
+    while (g_app_running)
     {
+        while (g_app_running && g_client_state != ClientState::CONNECTED)
+        {
+            handleX11Events(-1);
+
+            if (pollConnectResult(sock))
+            {
+                drawConnectionInterface();
+                XFlush(g_display);
+                break;
+            }
+
+            fd_set read_fds;
+            FD_ZERO(&read_fds);
+            int x11_fd = ConnectionNumber(g_display);
+            FD_SET(x11_fd, &read_fds);
+
+            timeval timeout = {};
+            timeout.tv_usec = 20000;
+            select(x11_fd + 1, &read_fds, nullptr, nullptr, &timeout);
+        }
+
+        if (!g_app_running)
+        {
+            break;
+        }
+
+        Packet hello = buildPacket(CMD_HELLO, "hello from linux client");
+        if (!sendPacket(sock, hello))
+        {
+            g_connection_status = "connect failed: hello send failed";
+            g_client_state = ClientState::FAILED;
+            close(sock);
+            sock = -1;
+            drawConnectionInterface();
+            continue;
+        }
+
+        recvLoop(sock);
         close(sock);
-        return 1;
+        sock = -1;
+
+        if (g_app_running)
+        {
+            resetRemoteState();
+            g_client_state = ClientState::WAITING;
+            g_connection_status = "waiting - disconnected";
+            XStoreName(g_display, g_window, "Linux Remote Control Client");
+            XResizeWindow(
+                g_display,
+                g_window,
+                CONNECTION_WINDOW_WIDTH,
+                CONNECTION_WINDOW_HEIGHT
+            );
+            g_window_width = CONNECTION_WINDOW_WIDTH;
+            g_window_height = CONNECTION_WINDOW_HEIGHT;
+            drawConnectionInterface();
+        }
     }
 
-    std::cout << "connecting to Windows server..." << std::endl;
-
-    // ================================
-    // 3. 连接 Windows server
-    // ================================
-    int ret = connect(
-        sock,
-        (sockaddr*)&server_addr,
-        sizeof(server_addr)
-    );
-
-    if (ret < 0)
+    if (sock >= 0)
     {
-        perror("connect");
+        shutdown(sock, SHUT_RDWR);
         close(sock);
-        return 1;
     }
 
-    int no_delay = 1;
-    if (setsockopt(
-            sock,
-            IPPROTO_TCP,
-            TCP_NODELAY,
-            &no_delay,
-            sizeof(no_delay)
-        ) != 0)
-    {
-        std::cout << "set TCP_NODELAY failed" << std::endl;
-    }
-
-    std::cout << "connect success!" << std::endl;
-
-    // ================================
-    // 4. 发送 hello，验证 Linux -> Windows 链路
-    // ================================
-    Packet hello = buildPacket(CMD_HELLO, "hello from linux client");
-
-    if (sendPacket(sock, hello))
-    {
-        std::cout << "send hello success" << std::endl;
-    }
-    else
-    {
-        std::cout << "send hello failed" << std::endl;
-    }
-
-    // ================================
-    // 5. 持续接收 Windows server 发来的 hello 和屏幕帧
-    // 说明：
-    //   之前这里有 sendKeyClick(sock, "A") 测试代码，
-    //   现在已经删除，避免每次启动都往 Windows 当前窗口输入 A。
-    // ================================
-    recvLoop(sock);
-
-    // ================================
-    // 6. 清理资源
-    // ================================
+    cancelConnectThread();
     closeDisplayWindow();
-    close(sock);
-
     return 0;
 }
 
-bool loadServerAddress(sockaddr_in& server_addr)
+std::string getServerConfigPath()
 {
     char executable_path[PATH_MAX] = {0};
-    ssize_t path_length = readlink("/proc/self/exe", executable_path, sizeof(executable_path) - 1);
+    ssize_t path_length = readlink(
+        "/proc/self/exe",
+        executable_path,
+        sizeof(executable_path) - 1
+    );
     if (path_length < 0)
     {
-        perror("failed to get program directory");
-        return false;
+        return "";
     }
-    executable_path[path_length] = '\0';
 
+    executable_path[path_length] = '\0';
     std::string config_path(executable_path);
     size_t separator = config_path.find_last_of('/');
     if (separator != std::string::npos)
@@ -190,13 +247,18 @@ bool loadServerAddress(sockaddr_in& server_addr)
     {
         config_path.clear();
     }
-    config_path += "server.conf";
+    return config_path + "server.conf";
+}
 
-    std::ifstream config(config_path);
+void loadServerConfig(std::string& host, std::string& port)
+{
+    host.clear();
+    port.clear();
+
+    std::ifstream config(getServerConfigPath());
     if (!config.is_open())
     {
-        std::cout << "server.conf not found: " << config_path << std::endl;
-        return false;
+        return;
     }
 
     auto trim = [](const std::string& value)
@@ -206,23 +268,14 @@ bool loadServerAddress(sockaddr_in& server_addr)
         {
             return std::string();
         }
-
         size_t last = value.find_last_not_of(" \t\r\n");
         return value.substr(first, last - first + 1);
     };
 
-    std::string server_host;
-    std::string server_port_text;
     std::string line;
-
     while (std::getline(config, line))
     {
         line = trim(line);
-        if (line.empty())
-        {
-            continue;
-        }
-
         size_t separator = line.find('=');
         if (separator == std::string::npos)
         {
@@ -231,39 +284,106 @@ bool loadServerAddress(sockaddr_in& server_addr)
 
         std::string key = trim(line.substr(0, separator));
         std::string value = trim(line.substr(separator + 1));
-
         if (key == "ip")
         {
-            server_host = value;
+            host = value;
         }
         else if (key == "port")
         {
-            server_port_text = value;
+            port = value;
         }
     }
 
-    if (server_host.empty())
+    if (!validatePort(port))
     {
-        std::cout << "ip is missing in server.conf: " << config_path << std::endl;
+        port.clear();
+    }
+}
+
+bool saveServerConfig(const std::string& host, const std::string& port)
+{
+    std::string config_path = getServerConfigPath();
+    if (config_path.empty())
+    {
         return false;
     }
 
-    if (server_port_text.empty())
+    std::ofstream config(config_path, std::ios::trunc);
+    if (!config.is_open())
     {
-        std::cout << "port is missing in server.conf: " << config_path << std::endl;
         return false;
     }
 
-    char* port_end = nullptr;
-    long server_port = std::strtol(server_port_text.c_str(), &port_end, 10);
-    if (port_end == server_port_text.c_str() || *port_end != '\0'
-        || server_port < 1 || server_port > 65535)
+    config << "ip=" << host << "\n";
+    config << "port=" << port << "\n";
+    return config.good();
+}
+
+bool validatePort(const std::string& port)
+{
+    if (port.empty())
     {
-        std::cout << "invalid port in server.conf: " << server_port_text << std::endl;
         return false;
     }
-    g_server_port = static_cast<int>(server_port);
 
+    char* end = nullptr;
+    long value = std::strtol(port.c_str(), &end, 10);
+    return end != port.c_str()
+        && *end == '\0'
+        && value >= 1
+        && value <= 65535;
+}
+
+void beginAsyncConnect()
+{
+    if (g_connecting || g_client_state == ClientState::CONNECTED)
+    {
+        return;
+    }
+
+    if (g_host_input.empty())
+    {
+        g_client_state = ClientState::FAILED;
+        g_connection_status = "connect failed: host is empty";
+        g_active_input = 1;
+        drawConnectionInterface();
+        return;
+    }
+
+    if (!validatePort(g_port_input))
+    {
+        g_client_state = ClientState::FAILED;
+        g_connection_status = "connect failed: port must be 1-65535";
+        g_active_input = 2;
+        drawConnectionInterface();
+        return;
+    }
+
+    if (g_connect_thread.joinable())
+    {
+        g_connect_thread.join();
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(g_connect_mutex);
+        g_connect_result_ready = false;
+        g_connect_result_socket = -1;
+        g_connect_result_error.clear();
+    }
+
+    g_connecting = true;
+    g_client_state = ClientState::CONNECTING;
+    g_connection_status = "connecting";
+    drawConnectionInterface();
+    g_connect_thread = std::thread(
+        connectWorker,
+        g_host_input,
+        g_port_input
+    );
+}
+
+void connectWorker(std::string host, std::string port)
+{
     addrinfo hints = {};
     hints.ai_family = AF_INET;
     hints.ai_socktype = SOCK_STREAM;
@@ -271,32 +391,172 @@ bool loadServerAddress(sockaddr_in& server_addr)
 
     addrinfo* address_list = nullptr;
     int resolve_result = getaddrinfo(
-        server_host.c_str(),
-        nullptr,
+        host.c_str(),
+        port.c_str(),
         &hints,
         &address_list
     );
 
     if (resolve_result != 0 || address_list == nullptr)
     {
-        std::cout << "resolve host failed: " << server_host;
-        if (resolve_result != 0)
-        {
-            std::cout << " (" << gai_strerror(resolve_result) << ")";
-        }
-        std::cout << std::endl;
-        return false;
+        std::lock_guard<std::mutex> lock(g_connect_mutex);
+        g_connect_result_error =
+            std::string("connect failed: ") + gai_strerror(resolve_result);
+        g_connect_result_ready = true;
+        return;
     }
 
-    const sockaddr_in* resolved_address =
-        reinterpret_cast<const sockaddr_in*>(address_list->ai_addr);
-    server_addr.sin_family = AF_INET;
-    server_addr.sin_addr = resolved_address->sin_addr;
-    server_addr.sin_port = htons(g_server_port);
+    int connected_socket = -1;
+    std::string last_error = "connect failed";
+
+    for (addrinfo* item = address_list;
+         item != nullptr && g_app_running;
+         item = item->ai_next)
+    {
+        int attempt_socket = socket(
+            item->ai_family,
+            item->ai_socktype,
+            item->ai_protocol
+        );
+        if (attempt_socket < 0)
+        {
+            last_error = "connect failed errno="
+                + std::to_string(errno) + ": " + strerror(errno);
+            continue;
+        }
+
+        {
+            std::lock_guard<std::mutex> lock(g_connect_mutex);
+            if (!g_app_running)
+            {
+                close(attempt_socket);
+                break;
+            }
+            g_pending_connect_socket = attempt_socket;
+        }
+
+        int result = connect(
+            attempt_socket,
+            item->ai_addr,
+            item->ai_addrlen
+        );
+        int connect_errno = errno;
+
+        bool still_owned = false;
+        {
+            std::lock_guard<std::mutex> lock(g_connect_mutex);
+            if (g_pending_connect_socket == attempt_socket)
+            {
+                g_pending_connect_socket = -1;
+                still_owned = true;
+            }
+        }
+
+        if (result == 0 && still_owned && g_app_running)
+        {
+            connected_socket = attempt_socket;
+            break;
+        }
+
+        last_error = "connect failed errno="
+            + std::to_string(connect_errno) + ": "
+            + strerror(connect_errno);
+        if (still_owned)
+        {
+            close(attempt_socket);
+        }
+    }
+
     freeaddrinfo(address_list);
 
-    std::cout << "server address: " << server_host << ":" << g_server_port << std::endl;
-    return true;
+    if (connected_socket >= 0)
+    {
+        int no_delay = 1;
+        setsockopt(
+            connected_socket,
+            IPPROTO_TCP,
+            TCP_NODELAY,
+            &no_delay,
+            sizeof(no_delay)
+        );
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(g_connect_mutex);
+        g_connect_result_socket = connected_socket;
+        g_connect_result_error =
+            connected_socket >= 0 ? "" : last_error;
+        g_connect_result_ready = true;
+    }
+}
+
+bool pollConnectResult(int& connected_socket)
+{
+    int result_socket = -1;
+    std::string error;
+
+    {
+        std::lock_guard<std::mutex> lock(g_connect_mutex);
+        if (!g_connect_result_ready)
+        {
+            return false;
+        }
+
+        result_socket = g_connect_result_socket;
+        error = g_connect_result_error;
+        g_connect_result_socket = -1;
+        g_connect_result_ready = false;
+    }
+
+    if (g_connect_thread.joinable())
+    {
+        g_connect_thread.join();
+    }
+    g_connecting = false;
+
+    if (result_socket >= 0)
+    {
+        connected_socket = result_socket;
+        g_client_state = ClientState::CONNECTED;
+        g_connection_status = "connected";
+        saveServerConfig(g_host_input, g_port_input);
+        return true;
+    }
+
+    g_client_state = ClientState::FAILED;
+    g_connection_status = error;
+    drawConnectionInterface();
+    return false;
+}
+
+void cancelConnectThread()
+{
+    {
+        std::lock_guard<std::mutex> lock(g_connect_mutex);
+        if (g_pending_connect_socket >= 0)
+        {
+            shutdown(g_pending_connect_socket, SHUT_RDWR);
+            close(g_pending_connect_socket);
+            g_pending_connect_socket = -1;
+        }
+    }
+
+    if (g_connect_thread.joinable())
+    {
+        g_connect_thread.join();
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(g_connect_mutex);
+        if (g_connect_result_socket >= 0)
+        {
+            close(g_connect_result_socket);
+            g_connect_result_socket = -1;
+        }
+        g_connect_result_ready = false;
+    }
+
+    g_connecting = false;
 }
 
 // ================================
@@ -544,6 +804,23 @@ void handleX11Events(int sock)
         XEvent event = {};
         XNextEvent(g_display, &event);
 
+        if (event.type == ClientMessage
+            && (Atom)event.xclient.data.l[0] == g_wm_delete_window)
+        {
+            g_app_running = false;
+            if (sock >= 0)
+            {
+                shutdown(sock, SHUT_RDWR);
+            }
+            continue;
+        }
+
+        if (g_client_state != ClientState::CONNECTED)
+        {
+            handleConnectionEvent(event);
+            continue;
+        }
+
         if (event.type == Expose)
         {
             drawFrameToWindow();
@@ -593,7 +870,9 @@ void handleX11Events(int sock)
     }
 
     auto now = std::chrono::steady_clock::now();
-    if (g_mouse_move_pending
+    if (sock >= 0
+        && g_client_state == ClientState::CONNECTED
+        && g_mouse_move_pending
         && now - g_last_mouse_send_time >= std::chrono::milliseconds(20))
     {
         int remote_x = 0;
@@ -611,6 +890,117 @@ void handleX11Events(int sock)
             g_mouse_move_pending = false;
         }
     }
+}
+
+void handleConnectionEvent(const XEvent& event)
+{
+    if (event.type == Expose)
+    {
+        drawConnectionInterface();
+        return;
+    }
+
+    if (event.type == ConfigureNotify)
+    {
+        g_window_width = event.xconfigure.width;
+        g_window_height = event.xconfigure.height;
+        drawConnectionInterface();
+        return;
+    }
+
+    if (g_client_state == ClientState::CONNECTING)
+    {
+        return;
+    }
+
+    if (event.type == ButtonPress)
+    {
+        int x = event.xbutton.x;
+        int y = event.xbutton.y;
+
+        if (x >= HOST_X && x <= HOST_X + HOST_WIDTH
+            && y >= HOST_Y && y <= HOST_Y + HOST_HEIGHT)
+        {
+            g_active_input = 1;
+        }
+        else if (x >= PORT_X && x <= PORT_X + PORT_WIDTH
+            && y >= PORT_Y && y <= PORT_Y + PORT_HEIGHT)
+        {
+            g_active_input = 2;
+        }
+        else if (x >= CONNECT_X && x <= CONNECT_X + CONNECT_WIDTH
+            && y >= CONNECT_Y && y <= CONNECT_Y + CONNECT_HEIGHT)
+        {
+            beginAsyncConnect();
+            return;
+        }
+
+        drawConnectionInterface();
+        return;
+    }
+
+    if (event.type != KeyPress)
+    {
+        return;
+    }
+
+    char text[32] = {0};
+    KeySym keysym = NoSymbol;
+    int text_length = XLookupString(
+        const_cast<XKeyEvent*>(&event.xkey),
+        text,
+        sizeof(text) - 1,
+        &keysym,
+        nullptr
+    );
+
+    if (keysym == XK_Return || keysym == XK_KP_Enter)
+    {
+        beginAsyncConnect();
+        return;
+    }
+
+    if (keysym == XK_Tab)
+    {
+        g_active_input = g_active_input == 1 ? 2 : 1;
+        drawConnectionInterface();
+        return;
+    }
+
+    std::string* active_text =
+        g_active_input == 1 ? &g_host_input : &g_port_input;
+
+    if (keysym == XK_BackSpace)
+    {
+        if (!active_text->empty())
+        {
+            active_text->pop_back();
+        }
+        drawConnectionInterface();
+        return;
+    }
+
+    for (int i = 0; i < text_length; ++i)
+    {
+        unsigned char ch = (unsigned char)text[i];
+        if (ch < 32 || ch > 126)
+        {
+            continue;
+        }
+
+        if (g_active_input == 2 && (ch < '0' || ch > '9'))
+        {
+            continue;
+        }
+
+        size_t max_length = g_active_input == 1 ? 255 : 5;
+        if (active_text->size() < max_length)
+        {
+            active_text->push_back((char)ch);
+        }
+    }
+
+    drawConnectionInterface();
 }
 
 // ================================
@@ -766,11 +1156,12 @@ void handleScreenEnd(const Packet& pkt)
 
     g_receiving_frame = false;
 
-    if (g_display == nullptr)
+    if (g_configured_remote_width != g_frame_width
+        || g_configured_remote_height != g_frame_height)
     {
         if (!initDisplayWindow(g_frame_width, g_frame_height))
         {
-            std::cout << "init display window failed" << std::endl;
+            std::cout << "resize display window failed" << std::endl;
             return;
         }
     }
@@ -834,7 +1225,7 @@ void recvLoop(int sock)
     char buffer[262144] = {0};
     int offset = 0;
 
-    while (true)
+    while (g_app_running && g_client_state == ClientState::CONNECTED)
     {
         if (offset >= (int)sizeof(buffer))
         {
@@ -935,23 +1326,9 @@ void recvLoop(int sock)
     }
 }
 
-// ================================
-// 函数功能：初始化 Linux client 的 X11 显示窗口
-// 作用：
-//   1. 连接本机 X11 图形环境
-//   2. 根据远程 Windows 屏幕比例创建合适大小的显示窗口
-//   3. 创建 GC 绘图上下文，供后续 drawFrameToWindow 使用
-// ================================
-bool initDisplayWindow(int width, int height)
+bool initConnectionWindow()
 {
-    if (width <= 0 || height <= 0)
-    {
-        std::cout << "invalid window size" << std::endl;
-        return false;
-    }
-
     g_display = XOpenDisplay(nullptr);
-
     if (g_display == nullptr)
     {
         std::cout << "XOpenDisplay failed" << std::endl;
@@ -959,40 +1336,13 @@ bool initDisplayWindow(int width, int height)
     }
 
     int screen = DefaultScreen(g_display);
-
-    int local_screen_width = DisplayWidth(g_display, screen);
-    int local_screen_height = DisplayHeight(g_display, screen);
-
-    int max_window_width = local_screen_width * 9 / 10;
-    int max_window_height = local_screen_height * 9 / 10;
-
-    double scale_x = (double)max_window_width / width;
-    double scale_y = (double)max_window_height / height;
-    double scale = std::min(scale_x, scale_y);
-
-    if (scale > 1.0)
-    {
-        scale = 1.0;
-    }
-
-    int window_width = (int)(width * scale);
-    int window_height = (int)(height * scale);
-
-    if (window_width <= 0 || window_height <= 0)
-    {
-        std::cout << "calculated window size invalid" << std::endl;
-        XCloseDisplay(g_display);
-        g_display = nullptr;
-        return false;
-    }
-
     g_window = XCreateSimpleWindow(
         g_display,
         RootWindow(g_display, screen),
         0,
         0,
-        window_width,
-        window_height,
+        CONNECTION_WINDOW_WIDTH,
+        CONNECTION_WINDOW_HEIGHT,
         1,
         BlackPixel(g_display, screen),
         WhitePixel(g_display, screen)
@@ -1006,7 +1356,7 @@ bool initDisplayWindow(int width, int height)
         return false;
     }
 
-    XStoreName(g_display, g_window, "Linux Client - Windows Screen");
+    XStoreName(g_display, g_window, "Linux Remote Control Client");
 
     XSelectInput(
         g_display,
@@ -1019,10 +1369,7 @@ bool initDisplayWindow(int width, int height)
         PointerMotionMask
     );
 
-    XMapWindow(g_display, g_window);
-
     g_gc = XCreateGC(g_display, g_window, 0, nullptr);
-
     if (g_gc == 0)
     {
         std::cout << "XCreateGC failed" << std::endl;
@@ -1035,17 +1382,167 @@ bool initDisplayWindow(int width, int height)
         return false;
     }
 
+    g_wm_delete_window = XInternAtom(
+        g_display,
+        "WM_DELETE_WINDOW",
+        False
+    );
+    XSetWMProtocols(
+        g_display,
+        g_window,
+        &g_wm_delete_window,
+        1
+    );
+
+    XMapWindow(g_display, g_window);
+    g_window_width = CONNECTION_WINDOW_WIDTH;
+    g_window_height = CONNECTION_WINDOW_HEIGHT;
+    XFlush(g_display);
+    return true;
+}
+
+bool initDisplayWindow(int width, int height)
+{
+    if (g_display == nullptr || g_window == 0)
+    {
+        return false;
+    }
+
+    if (width <= 0 || height <= 0)
+    {
+        return false;
+    }
+
+    int screen = DefaultScreen(g_display);
+    int max_window_width = DisplayWidth(g_display, screen) * 9 / 10;
+    int max_window_height = DisplayHeight(g_display, screen) * 9 / 10;
+
+    double scale_x = (double)max_window_width / width;
+    double scale_y = (double)max_window_height / height;
+    double scale = std::min(scale_x, scale_y);
+    if (scale > 1.0)
+    {
+        scale = 1.0;
+    }
+
+    int window_width = std::max(1, (int)(width * scale));
+    int window_height = std::max(1, (int)(height * scale));
+
+    XStoreName(g_display, g_window, "Linux Client - Remote Screen");
+    XResizeWindow(g_display, g_window, window_width, window_height);
     g_window_width = window_width;
     g_window_height = window_height;
+    g_configured_remote_width = width;
+    g_configured_remote_height = height;
 
     XFlush(g_display);
-
-    std::cout << "display window init success: remote="
-              << width << "x" << height
-              << ", window=" << g_window_width << "x" << g_window_height
-              << std::endl;
-
     return true;
+}
+
+void drawConnectionInterface()
+{
+    if (g_display == nullptr || g_window == 0 || g_gc == 0)
+    {
+        return;
+    }
+
+    XClearWindow(g_display, g_window);
+    int screen = DefaultScreen(g_display);
+    unsigned long black = BlackPixel(g_display, screen);
+    unsigned long white = WhitePixel(g_display, screen);
+
+    XSetForeground(g_display, g_gc, black);
+    const char* title = "Remote Control Connection";
+    XDrawString(g_display, g_window, g_gc, 35, 35, title, strlen(title));
+
+    const char* host_label = "Host:";
+    const char* port_label = "Port:";
+    XDrawString(
+        g_display, g_window, g_gc,
+        55, HOST_Y + 23,
+        host_label, strlen(host_label)
+    );
+    XDrawString(
+        g_display, g_window, g_gc,
+        55, PORT_Y + 23,
+        port_label, strlen(port_label)
+    );
+
+    XDrawRectangle(
+        g_display, g_window, g_gc,
+        HOST_X, HOST_Y, HOST_WIDTH, HOST_HEIGHT
+    );
+    XDrawRectangle(
+        g_display, g_window, g_gc,
+        PORT_X, PORT_Y, PORT_WIDTH, PORT_HEIGHT
+    );
+
+    if (g_active_input == 1)
+    {
+        XDrawRectangle(
+            g_display, g_window, g_gc,
+            HOST_X - 2, HOST_Y - 2,
+            HOST_WIDTH + 4, HOST_HEIGHT + 4
+        );
+    }
+    else
+    {
+        XDrawRectangle(
+            g_display, g_window, g_gc,
+            PORT_X - 2, PORT_Y - 2,
+            PORT_WIDTH + 4, PORT_HEIGHT + 4
+        );
+    }
+
+    std::string visible_host = g_host_input;
+    if (visible_host.size() > 55)
+    {
+        visible_host = visible_host.substr(visible_host.size() - 55);
+    }
+
+    XDrawString(
+        g_display, g_window, g_gc,
+        HOST_X + 8, HOST_Y + 23,
+        visible_host.c_str(), visible_host.size()
+    );
+    XDrawString(
+        g_display, g_window, g_gc,
+        PORT_X + 8, PORT_Y + 23,
+        g_port_input.c_str(), g_port_input.size()
+    );
+
+    if (g_client_state == ClientState::CONNECTING)
+    {
+        XSetForeground(g_display, g_gc, white);
+        XFillRectangle(
+            g_display, g_window, g_gc,
+            CONNECT_X, CONNECT_Y, CONNECT_WIDTH, CONNECT_HEIGHT
+        );
+        XSetForeground(g_display, g_gc, black);
+    }
+
+    XDrawRectangle(
+        g_display, g_window, g_gc,
+        CONNECT_X, CONNECT_Y, CONNECT_WIDTH, CONNECT_HEIGHT
+    );
+
+    const char* button_text =
+        g_client_state == ClientState::CONNECTING
+            ? "Connecting..."
+            : "Connect";
+    XDrawString(
+        g_display, g_window, g_gc,
+        CONNECT_X + 62, CONNECT_Y + 25,
+        button_text, strlen(button_text)
+    );
+
+    XDrawString(
+        g_display, g_window, g_gc,
+        55, 255,
+        g_connection_status.c_str(),
+        g_connection_status.size()
+    );
+    XFlush(g_display);
 }
 
 // ================================
@@ -1144,6 +1641,20 @@ void drawFrameToWindow()
 
     image->data = nullptr;
     XDestroyImage(image);
+}
+
+void resetRemoteState()
+{
+    g_frame_buffer.clear();
+    g_frame_id = -1;
+    g_frame_width = 0;
+    g_frame_height = 0;
+    g_frame_total_size = 0;
+    g_frame_received_size = 0;
+    g_receiving_frame = false;
+    g_configured_remote_width = 0;
+    g_configured_remote_height = 0;
+    g_mouse_move_pending = false;
 }
 
 // ================================
