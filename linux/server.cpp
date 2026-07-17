@@ -4,6 +4,7 @@
 #include <string.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <netdb.h>
 #include <cstdio>
 #include <cstdlib>
@@ -35,7 +36,12 @@ void handleKeyEvent(const char *data, int len);
 bool sendAll(int sock, const char *buf, int len);
 bool sendPacket(int sock, const Packet &pkt);
 
-void sendRealScreenFrame(int client_fd, int frame_id);
+bool sendRealScreenFrame(
+    int client_fd,
+    int frame_id,
+    bool& frame_sent,
+    long long& send_ms
+);
 
 int createServerSocket(int port);
 void printLocalIPv4Addresses(int port);
@@ -46,8 +52,9 @@ void recvLoop(int client_fd);
 std::atomic<bool> g_running(true);
 
 const int SERVER_PORT = 9999;
-const useconds_t SCREEN_CHUNK_DELAY_US = 10000;
-const useconds_t SCREEN_FRAME_DELAY_US = 1000000;
+const int MIN_FRAME_INTERVAL_MS = 50;
+const int UNCHANGED_FRAME_INTERVAL_MS = 100;
+const int MAX_FRAME_INTERVAL_MS = 1000;
 
 int main()
 {
@@ -81,10 +88,8 @@ int main()
     sendPacket(client_fd, hello);
 
     // ================================
-    // 4. 第一版屏幕回传：连续发送 5 帧真实截图
-    // 当前版本是同步发送：
-    // 发送屏幕期间暂时不会处理键鼠消息
-    // 后续可以改成独立线程，让屏幕发送和键鼠接收并行
+    // 4. 屏幕回传使用独立线程
+    // 屏幕发送和键鼠接收并行，慢速发送不会阻塞控制事件处理
     // ================================
 
     std::thread screen_thread(screenSendLoop, client_fd);
@@ -94,6 +99,7 @@ int main()
     // ================================
     recvLoop(client_fd);
     g_running = false;
+    shutdown(client_fd, SHUT_RDWR);
 
     // ================================
     // 6. 关闭连接
@@ -261,6 +267,21 @@ void printLocalIPv4Addresses(int port)
 int acceptClient(int server_fd)
 {
     int client_fd = accept(server_fd, NULL, NULL);
+
+    if (client_fd >= 0)
+    {
+        int no_delay = 1;
+        if (setsockopt(
+                client_fd,
+                IPPROTO_TCP,
+                TCP_NODELAY,
+                &no_delay,
+                sizeof(no_delay)
+            ) != 0)
+        {
+            std::cout << "set TCP_NODELAY failed: " << strerror(errno) << std::endl;
+        }
+    }
 
     return client_fd;
 }
@@ -596,11 +617,22 @@ bool sendPacket(int sock, const Packet &pkt)
 // 1. 使用 X11 的 XGetImage 抓取整张桌面截图
 // 2. 将 XImage 像素转换为 Windows 端可显示的 BGRA32 格式
 // 3. 使用 SCREEN_BEGIN / SCREEN_CHUNK / SCREEN_END 分包发送
-// 4. 第一版不做压缩、不做差分、不做高帧率优化
+// 4. 未变化帧跳过发送，变化帧仍使用原始 BGRA32 完整传输
 // ================================
-void sendRealScreenFrame(int client_fd, int frame_id)
+bool sendRealScreenFrame(
+    int client_fd,
+    int frame_id,
+    bool& frame_sent,
+    long long& send_ms
+)
 {
+    frame_sent = false;
+    send_ms = 0;
+
     auto t0 = std::chrono::steady_clock::now();
+    static std::vector<unsigned char> previous_frame;
+    static int previous_width = 0;
+    static int previous_height = 0;
 
     // ================================
     // XShm 相关对象只初始化一次
@@ -621,7 +653,7 @@ void sendRealScreenFrame(int client_fd, int frame_id)
         if (display == NULL)
         {
             std::cout << "XOpenDisplay failed" << std::endl;
-            return;
+            return false;
         }
         root = DefaultRootWindow(display);
 
@@ -630,7 +662,7 @@ void sendRealScreenFrame(int client_fd, int frame_id)
         if (XGetWindowAttributes(display, root, &linuxwindow) == 0)
         {
             std::cout << "XGetWindowAttributes failed" << std::endl;
-            return;
+            return false;
         }
 
         width = linuxwindow.width;
@@ -655,7 +687,7 @@ void sendRealScreenFrame(int client_fd, int frame_id)
         if (image == NULL)
         {
             std::cout << "XShmCreateImage failed" << std::endl;
-            return;
+            return false;
         }
 
         // 为 XImage 分配共享内存
@@ -672,7 +704,7 @@ void sendRealScreenFrame(int client_fd, int frame_id)
             std::cout << "shmget failed" << std::endl;
             XDestroyImage(image);
             image = NULL;
-            return;
+            return false;
         }
 
         shminfo.shmaddr = (char*)shmat(shminfo.shmid, 0, 0);
@@ -683,7 +715,7 @@ void sendRealScreenFrame(int client_fd, int frame_id)
             shmctl(shminfo.shmid, IPC_RMID, 0);
             XDestroyImage(image);
             image = NULL;
-            return;
+            return false;
         }
 
         image->data = shminfo.shmaddr;
@@ -697,7 +729,7 @@ void sendRealScreenFrame(int client_fd, int frame_id)
             shmctl(shminfo.shmid, IPC_RMID, 0);
             XDestroyImage(image);
             image = NULL;
-            return;
+            return false;
         }
 
         // 标记这块共享内存可删除
@@ -722,7 +754,7 @@ void sendRealScreenFrame(int client_fd, int frame_id)
     if (!XShmGetImage(display, root, image, 0, 0, AllPlanes))
     {
         std::cout << "XShmGetImage failed" << std::endl;
-        return;
+        return false;
     }
 
     auto t1 = std::chrono::steady_clock::now();
@@ -764,10 +796,18 @@ void sendRealScreenFrame(int client_fd, int frame_id)
     {
         std::cout << "unsupported bits_per_pixel="
                   << image->bits_per_pixel << std::endl;
-        return;
+        return false;
     }
 
     auto t2 = std::chrono::steady_clock::now();
+
+    if (previous_width == width
+        && previous_height == height
+        && previous_frame.size() == frame.size()
+        && memcmp(previous_frame.data(), frame.data(), frame.size()) == 0)
+    {
+        return true;
+    }
 
     // ================================
     // 4. 构造屏幕帧头信息
@@ -789,11 +829,8 @@ void sendRealScreenFrame(int client_fd, int frame_id)
     if (!sendPacket(client_fd, begin_pkt))
     {
         std::cout << "send screen begin failed" << std::endl;
-        return;
+        return false;
     }
-
-    std::cout << "screen begin sent frame=" << frame_id
-              << " size=" << total_size << std::endl;
 
     // ================================
     // 5. 分包发送图像数据
@@ -831,22 +868,11 @@ void sendRealScreenFrame(int client_fd, int frame_id)
         if (!sendPacket(client_fd, chunk_pkt))
         {
             std::cout << "send screen chunk failed" << std::endl;
-            return;
+            return false;
         }
 
         offset += data_len;
         chunk_count++;
-
-        if (chunk_count % 10 == 0 || offset == total_size)
-        {
-            std::cout << "screen chunk sent frame=" << frame_id
-                      << " chunks=" << chunk_count
-                      << " bytes=" << offset
-                      << "/" << total_size
-                      << std::endl;
-        }
-
-        usleep(SCREEN_CHUNK_DELAY_US);
     }
 
     // ================================
@@ -863,13 +889,16 @@ void sendRealScreenFrame(int client_fd, int frame_id)
     if (!sendPacket(client_fd, end_pkt))
     {
         std::cout << "send screen end failed" << std::endl;
-        return;
+        return false;
     }
 
-    std::cout << "screen end sent frame=" << frame_id
-              << " chunks=" << chunk_count << std::endl;
-
     auto t3 = std::chrono::steady_clock::now();
+    send_ms = std::chrono::duration_cast<std::chrono::milliseconds>(t3 - t2).count();
+    frame_sent = true;
+
+    previous_frame.swap(frame);
+    previous_width = width;
+    previous_height = height;
 
     // ================================
     // 7. 每 10 帧打印一次性能统计
@@ -881,25 +910,80 @@ void sendRealScreenFrame(int client_fd, int frame_id)
     {
         auto capture_ms = std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count();
         auto convert_ms = std::chrono::duration_cast<std::chrono::milliseconds>(t2 - t1).count();
-        auto send_ms = std::chrono::duration_cast<std::chrono::milliseconds>(t3 - t2).count();
+        auto measured_send_ms = std::chrono::duration_cast<std::chrono::milliseconds>(t3 - t2).count();
         auto total_ms = std::chrono::duration_cast<std::chrono::milliseconds>(t3 - t0).count();
 
         std::cout << "[frame " << frame_id << "] "
                   << "capture=" << capture_ms << "ms, "
                   << "convert=" << convert_ms << "ms, "
-                  << "send=" << send_ms << "ms, "
+                  << "send=" << measured_send_ms << "ms, "
                   << "total=" << total_ms << "ms, "
                   << "chunks=" << chunk_count
                   << std::endl;
     }
+
+    return true;
 }
 
 void screenSendLoop(int client_fd){
     int frame_id = 1;
+    long long average_send_ms = 0;
+
     while (g_running)
     {
-        sendRealScreenFrame(client_fd, frame_id);
-        frame_id++;
-        usleep(SCREEN_FRAME_DELAY_US);
+        auto loop_start = std::chrono::steady_clock::now();
+        bool frame_sent = false;
+        long long send_ms = 0;
+
+        if (!sendRealScreenFrame(
+                client_fd,
+                frame_id,
+                frame_sent,
+                send_ms
+            ))
+        {
+            g_running = false;
+            shutdown(client_fd, SHUT_RDWR);
+            break;
+        }
+
+        int target_interval_ms = UNCHANGED_FRAME_INTERVAL_MS;
+
+        if (frame_sent)
+        {
+            frame_id++;
+
+            long long measured_send_ms = std::max(1LL, send_ms);
+            if (average_send_ms == 0)
+            {
+                average_send_ms = measured_send_ms;
+            }
+            else
+            {
+                average_send_ms = (average_send_ms * 3 + measured_send_ms) / 4;
+            }
+
+            long long adaptive_interval = average_send_ms * 5 / 4;
+            adaptive_interval = std::max(
+                (long long)MIN_FRAME_INTERVAL_MS,
+                std::min(
+                    (long long)MAX_FRAME_INTERVAL_MS,
+                    adaptive_interval
+                )
+            );
+            target_interval_ms = (int)adaptive_interval;
+        }
+
+        auto loop_end = std::chrono::steady_clock::now();
+        long long loop_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+            loop_end - loop_start
+        ).count();
+
+        if (loop_ms < target_interval_ms)
+        {
+            std::this_thread::sleep_for(
+                std::chrono::milliseconds(target_interval_ms - loop_ms)
+            );
+        }
     }
 }

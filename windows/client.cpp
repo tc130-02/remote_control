@@ -516,6 +516,17 @@ bool ConnectServer()
         return false;
     }
 
+    BOOL no_delay = TRUE;
+    if (setsockopt(
+            g_server_socket,
+            IPPROTO_TCP,
+            TCP_NODELAY,
+            (const char*)&no_delay,
+            sizeof(no_delay)
+        ) == SOCKET_ERROR) {
+        std::cout << "set TCP_NODELAY failed: " << WSAGetLastError() << std::endl;
+    }
+
     std::cout << "connect success!" << std::endl;
     return true;
 }

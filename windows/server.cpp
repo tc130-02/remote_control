@@ -26,6 +26,9 @@
 const int SERVER_PORT = 9999;
 const int RECV_BUFFER_SIZE = 262144;
 const int MAX_SCREEN_SIZE = 100 * 1024 * 1024;
+const int MIN_FRAME_INTERVAL_MS = 50;
+const int UNCHANGED_FRAME_INTERVAL_MS = 100;
+const int MAX_FRAME_INTERVAL_MS = 1000;
 
 SOCKET g_server_socket = INVALID_SOCKET;
 SOCKET g_client_socket = INVALID_SOCKET;
@@ -36,7 +39,12 @@ void printLocalIPv4Addresses(int port);
 SOCKET acceptClient(SOCKET server_socket);
 void recvLoop(SOCKET client_socket);
 void screenSendLoop(SOCKET client_socket);
-bool sendRealScreenFrame(SOCKET client_socket, int frame_id);
+bool sendRealScreenFrame(
+    SOCKET client_socket,
+    int frame_id,
+    bool& frame_sent,
+    long long& send_ms
+);
 
 Packet buildPacket(int cmd, const char* msg);
 Packet buildRawPacket(int cmd, const char* buffer, int len);
@@ -210,6 +218,17 @@ SOCKET acceptClient(SOCKET server_socket)
     if (client_socket == INVALID_SOCKET) {
         std::cout << "accept failed: " << WSAGetLastError() << std::endl;
         return INVALID_SOCKET;
+    }
+
+    BOOL no_delay = TRUE;
+    if (setsockopt(
+            client_socket,
+            IPPROTO_TCP,
+            TCP_NODELAY,
+            (const char*)&no_delay,
+            sizeof(no_delay)
+        ) == SOCKET_ERROR) {
+        std::cout << "set TCP_NODELAY failed: " << WSAGetLastError() << std::endl;
     }
 
     std::cout << "client ip=" << inet_ntoa(client_addr.sin_addr)
@@ -636,9 +655,20 @@ void handleKeyEvent(const char* data, int len)
     }
 }
 
-bool sendRealScreenFrame(SOCKET client_socket, int frame_id)
+bool sendRealScreenFrame(
+    SOCKET client_socket,
+    int frame_id,
+    bool& frame_sent,
+    long long& send_ms
+)
 {
+    frame_sent = false;
+    send_ms = 0;
+
     auto t0 = std::chrono::steady_clock::now();
+    static std::vector<unsigned char> previous_frame;
+    static int previous_width = 0;
+    static int previous_height = 0;
 
     int width = GetSystemMetrics(SM_CXSCREEN);
     int height = GetSystemMetrics(SM_CYSCREEN);
@@ -714,6 +744,13 @@ bool sendRealScreenFrame(SOCKET client_socket, int frame_id)
     DeleteDC(mem_dc);
     ReleaseDC(NULL, screen_dc);
 
+    if (previous_width == width
+        && previous_height == height
+        && previous_frame.size() == frame.size()
+        && memcmp(previous_frame.data(), frame.data(), frame.size()) == 0) {
+        return true;
+    }
+
     ScreenFrameInfo info = {};
     info.frame_id = frame_id;
     info.width = width;
@@ -766,6 +803,12 @@ bool sendRealScreenFrame(SOCKET client_socket, int frame_id)
     }
 
     auto t3 = std::chrono::steady_clock::now();
+    send_ms = std::chrono::duration_cast<std::chrono::milliseconds>(t3 - t2).count();
+    frame_sent = true;
+
+    previous_frame.swap(frame);
+    previous_width = width;
+    previous_height = height;
 
     static int debug_frame_count = 0;
     debug_frame_count++;
@@ -773,13 +816,13 @@ bool sendRealScreenFrame(SOCKET client_socket, int frame_id)
     if (debug_frame_count % 10 == 0) {
         auto capture_ms = std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count();
         auto convert_ms = std::chrono::duration_cast<std::chrono::milliseconds>(t2 - t1).count();
-        auto send_ms = std::chrono::duration_cast<std::chrono::milliseconds>(t3 - t2).count();
+        auto measured_send_ms = std::chrono::duration_cast<std::chrono::milliseconds>(t3 - t2).count();
         auto total_ms = std::chrono::duration_cast<std::chrono::milliseconds>(t3 - t0).count();
 
         std::cout << "[frame " << frame_id << "] "
                   << "capture=" << capture_ms << "ms, "
                   << "convert=" << convert_ms << "ms, "
-                  << "send=" << send_ms << "ms, "
+                  << "send=" << measured_send_ms << "ms, "
                   << "total=" << total_ms << "ms, "
                   << "chunks=" << chunk_count << std::endl;
     }
@@ -790,14 +833,57 @@ bool sendRealScreenFrame(SOCKET client_socket, int frame_id)
 void screenSendLoop(SOCKET client_socket)
 {
     int frame_id = 1;
+    long long average_send_ms = 0;
 
     while (g_running) {
-        if (!sendRealScreenFrame(client_socket, frame_id)) {
+        auto loop_start = std::chrono::steady_clock::now();
+        bool frame_sent = false;
+        long long send_ms = 0;
+
+        if (!sendRealScreenFrame(
+                client_socket,
+                frame_id,
+                frame_sent,
+                send_ms
+            )) {
             g_running = false;
+            shutdown(client_socket, SD_BOTH);
             break;
         }
 
-        frame_id++;
-        Sleep(50);
+        int target_interval_ms = UNCHANGED_FRAME_INTERVAL_MS;
+
+        if (frame_sent) {
+            frame_id++;
+
+            long long measured_send_ms = std::max(1LL, send_ms);
+            if (average_send_ms == 0) {
+                average_send_ms = measured_send_ms;
+            }
+            else {
+                average_send_ms = (average_send_ms * 3 + measured_send_ms) / 4;
+            }
+
+            long long adaptive_interval = average_send_ms * 5 / 4;
+            adaptive_interval = std::max(
+                (long long)MIN_FRAME_INTERVAL_MS,
+                std::min(
+                    (long long)MAX_FRAME_INTERVAL_MS,
+                    adaptive_interval
+                )
+            );
+            target_interval_ms = (int)adaptive_interval;
+        }
+
+        auto loop_end = std::chrono::steady_clock::now();
+        long long loop_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+            loop_end - loop_start
+        ).count();
+
+        if (loop_ms < target_interval_ms) {
+            std::this_thread::sleep_for(
+                std::chrono::milliseconds(target_interval_ms - loop_ms)
+            );
+        }
     }
 }

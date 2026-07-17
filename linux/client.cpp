@@ -2,16 +2,20 @@
 #include <unistd.h>
 #include <arpa/inet.h>
 #include <sys/socket.h>
+#include <sys/select.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <netdb.h>
 #include <cstring>
 #include <cstdlib>
 #include <cstdio>
 #include <string>
 #include <fstream>
+#include <cerrno>
 #include <limits.h>
 #include <vector>
 #include <algorithm>
+#include <chrono>
 
 #include <X11/Xlib.h>
 #include <X11/Xutil.h>
@@ -41,6 +45,12 @@ GC g_gc = 0;
 
 int g_window_width = 0;
 int g_window_height = 0;
+
+bool g_mouse_move_pending = false;
+int g_pending_mouse_x = 0;
+int g_pending_mouse_y = 0;
+std::chrono::steady_clock::time_point g_last_mouse_send_time =
+    std::chrono::steady_clock::now() - std::chrono::milliseconds(100);
 
 // ================================
 // 函数声明
@@ -112,6 +122,18 @@ int main()
         perror("connect");
         close(sock);
         return 1;
+    }
+
+    int no_delay = 1;
+    if (setsockopt(
+            sock,
+            IPPROTO_TCP,
+            TCP_NODELAY,
+            &no_delay,
+            sizeof(no_delay)
+        ) != 0)
+    {
+        std::cout << "set TCP_NODELAY failed" << std::endl;
     }
 
     std::cout << "connect success!" << std::endl;
@@ -287,7 +309,7 @@ bool sendAll(int sock, const char* buf, int len)
 
     while (total < len)
     {
-        int n = send(sock, buf + total, len - total, 0);
+        int n = send(sock, buf + total, len - total, MSG_NOSIGNAL);
 
         if (n <= 0)
         {
@@ -534,18 +556,9 @@ void handleX11Events(int sock)
         }
         else if (event.type == MotionNotify)
         {
-            int local_x = event.xmotion.x;
-            int local_y = event.xmotion.y;
-
-            int remote_x = 0;
-            int remote_y = 0;
-
-            if (!convertLocalToRemote(local_x, local_y, remote_x, remote_y))
-            {
-                return;
-            }
-
-            sendMouseEvent(sock, MOUSE_ACTION_MOVE, 0, remote_x, remote_y);
+            g_pending_mouse_x = event.xmotion.x;
+            g_pending_mouse_y = event.xmotion.y;
+            g_mouse_move_pending = true;
         }
         else if (event.type == ButtonPress)
         {
@@ -576,6 +589,26 @@ void handleX11Events(int sock)
 
             int key_status = event.type == KeyPress ? KEY_STATUS_DOWN : KEY_STATUS_UP;
             sendKeyEvent(sock, key_status, key_name);
+        }
+    }
+
+    auto now = std::chrono::steady_clock::now();
+    if (g_mouse_move_pending
+        && now - g_last_mouse_send_time >= std::chrono::milliseconds(20))
+    {
+        int remote_x = 0;
+        int remote_y = 0;
+
+        if (convertLocalToRemote(
+                g_pending_mouse_x,
+                g_pending_mouse_y,
+                remote_x,
+                remote_y
+            ))
+        {
+            sendMouseEvent(sock, MOUSE_ACTION_MOVE, 0, remote_x, remote_y);
+            g_last_mouse_send_time = now;
+            g_mouse_move_pending = false;
         }
     }
 }
@@ -809,6 +842,48 @@ void recvLoop(int sock)
             break;
         }
 
+        handleX11Events(sock);
+
+        fd_set read_fds;
+        FD_ZERO(&read_fds);
+        FD_SET(sock, &read_fds);
+
+        int max_fd = sock;
+        int x11_fd = -1;
+
+        if (g_display != nullptr)
+        {
+            x11_fd = ConnectionNumber(g_display);
+            FD_SET(x11_fd, &read_fds);
+            max_fd = std::max(max_fd, x11_fd);
+        }
+
+        timeval timeout = {};
+        timeout.tv_usec = 20000;
+
+        int ready = select(max_fd + 1, &read_fds, nullptr, nullptr, &timeout);
+
+        if (ready < 0)
+        {
+            if (errno == EINTR)
+            {
+                continue;
+            }
+
+            std::cout << "select failed: " << strerror(errno) << std::endl;
+            break;
+        }
+
+        if (x11_fd >= 0 && FD_ISSET(x11_fd, &read_fds))
+        {
+            handleX11Events(sock);
+        }
+
+        if (ready == 0 || !FD_ISSET(sock, &read_fds))
+        {
+            continue;
+        }
+
         int len = recv(sock, buffer + offset, sizeof(buffer) - offset, 0);
 
         if (len == 0)
@@ -856,7 +931,6 @@ void recvLoop(int sock)
             offset = remain;
         }
 
-        // 处理 Linux client 窗口里的鼠标移动、点击、重绘事件
         handleX11Events(sock);
     }
 }
