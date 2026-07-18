@@ -34,21 +34,29 @@
 
 #include "../common/packet.h"
 
-// ================================
-// 函数声明
-// ================================
 void handleMouseMove(const char *data);
 void handleKeyPress(const char *data);
 void handlePacket(const Packet &pkt);
 void handleMouseClick(const char *data);
 void handleMouseEvent(const char *data, int len);
 void handleKeyEvent(const char *data, int len);
+void runCommand(const char* command);
 
 bool sendAll(int sock, const char *buf, int len);
 bool sendPacket(int sock, const Packet &pkt);
 void writeJpegToVector(void* context, void* data, int size);
 unsigned long readXImagePixel(const XImage* image, int x, int y);
 unsigned char extractColorChannel(unsigned long pixel, unsigned long mask);
+
+void runCommand(const char* command)
+{
+    int result = std::system(command);
+    if (result != 0)
+    {
+        std::cout << "command failed (" << result << "): "
+                  << command << std::endl;
+    }
+}
 
 void writeJpegToVector(void* context, void* data, int size)
 {
@@ -137,25 +145,15 @@ const long long MAX_PROTOCOL_FRAME_SIZE = INT_MAX;
 
 int main()
 {
-    // ================================
-    // 1. 创建监听 socket
-    // ================================
     int server_fd = createServerSocket(SERVER_PORT);
 
     printLocalIPv4Addresses(SERVER_PORT);
     std::cout << "server waiting on 0.0.0.0:" << SERVER_PORT << " ..." << std::endl;
 
-    // ================================
-    // 2. 等待 Windows 客户端连接
-    // ================================
     int client_fd = acceptClient(server_fd);
 
     std::cout << "client connected" << std::endl;
 
-    // ================================
-    // 3. 发送 Linux -> Windows 的测试包
-    // 用于验证反向通信链路是否正常
-    // ================================
     Packet hello = {};
     hello.magic = PACKET_MAGIC;
     hello.cmd = CMD_HELLO;
@@ -166,23 +164,13 @@ int main()
 
     sendPacket(client_fd, hello);
 
-    // ================================
-    // 4. 屏幕回传使用独立线程
-    // 屏幕发送和键鼠接收并行，慢速发送不会阻塞控制事件处理
-    // ================================
-
+    // A blocked screen send must not delay incoming keyboard or mouse events.
     std::thread screen_thread(screenSendLoop, client_fd);
 
-    // ================================
-    // 5. 循环接收 Windows 发来的键鼠控制命令
-    // ================================
     recvLoop(client_fd);
     g_running = false;
     shutdown(client_fd, SHUT_RDWR);
 
-    // ================================
-    // 6. 关闭连接
-    // ================================
     screen_thread.join();
     close(client_fd);
     close(server_fd);
@@ -190,10 +178,7 @@ int main()
     return 0;
 }
 
-// ================================
-// 处理旧版鼠标移动命令
-// data 格式："x,y"
-// ================================
+// Legacy text commands remain available for clients that predate MouseEvent.
 void handleMouseMove(const char *data)
 {
     int x = 0;
@@ -204,42 +189,33 @@ void handleMouseMove(const char *data)
 
     snprintf(cmd, sizeof(cmd), "xdotool mousemove %d %d", x, y);
 
-    system(cmd);
+    runCommand(cmd);
 
     std::cout << "mouse move x=" << x << " y=" << y << std::endl;
 }
 
-// ================================
-// 处理旧版键盘命令
-// data 是按键字符串，例如 a / Return / Escape
-// ================================
 void handleKeyPress(const char *data)
 {
     char cmd[128];
 
     snprintf(cmd, sizeof(cmd), "xdotool key %s", data);
 
-    system(cmd);
+    runCommand(cmd);
 
-    std::cout << "收到键盘命令：" << data << std::endl;
+    std::cout << "key press: " << data << std::endl;
 }
 
-// ================================
-// 分发 Packet 命令
-// 根据 cmd 字段调用不同的处理函数
-// ================================
 void handlePacket(const Packet &pkt)
 {
-    // 校验 magic，过滤非法数据包
     if (pkt.magic != PACKET_MAGIC)
     {
-        std::cout << "非法数据包, magic错误: " << pkt.magic << std::endl;
+        std::cout << "invalid packet magic: " << pkt.magic << std::endl;
         return;
     }
 
     if (pkt.cmd == CMD_HELLO)
     {
-        std::cout << "收到测试命令：" << pkt.data << std::endl;
+        std::cout << "recv hello: " << pkt.data << std::endl;
     }
     else if (pkt.cmd == CMD_MOUSE_MOVE)
     {
@@ -263,13 +239,10 @@ void handlePacket(const Packet &pkt)
     }
     else
     {
-        std::cout << "未知命令：" << pkt.cmd << std::endl;
+        std::cout << "unknown command: " << pkt.cmd << std::endl;
     }
 }
 
-// ================================
-// 创建监听 socket
-// ================================
 int createServerSocket(int port)
 {
     int server_fd = socket(AF_INET, SOCK_STREAM, 0);
@@ -340,9 +313,6 @@ void printLocalIPv4Addresses(int port)
     }
 }
 
-// ================================
-// 等待客户端连接
-// ================================
 int acceptClient(int server_fd)
 {
     int client_fd = accept(server_fd, NULL, NULL);
@@ -365,11 +335,6 @@ int acceptClient(int server_fd)
     return client_fd;
 }
 
-// ================================
-// 循环接收并拆包
-// TCP 是字节流，可能出现粘包和半包
-// 所以这里用 buffer + offset 保存未处理完的数据
-// ================================
 void recvLoop(int client_fd)
 {
     char buffer[262144] = {0};
@@ -402,9 +367,7 @@ void recvLoop(int client_fd)
 
         while (true)
         {
-            // 一个 Packet 至少有 12 字节包头：
-            // magic 4 字节 + cmd 4 字节 + body_len 4 字节
-            if (offset < 12)
+            if (offset < PACKET_HEADER_SIZE)
             {
                 break;
             }
@@ -413,16 +376,14 @@ void recvLoop(int client_fd)
 
             memcpy(&body_len, buffer + 8, sizeof(int));
 
-            // 当前协议中 Packet.data 最大是 256 字节
             if (body_len < 0 || body_len > PACKET_DATA_SIZE)
             {
-                std::cout << "非法 body_len: " << body_len << std::endl;
+                std::cout << "invalid body_len: " << body_len << std::endl;
                 offset = 0;
                 break;
             }
 
-            // 数据还没收完整，继续等下一次 recv
-            if (offset < 12 + body_len)
+            if (offset < PACKET_HEADER_SIZE + body_len)
             {
                 break;
             }
@@ -431,9 +392,9 @@ void recvLoop(int client_fd)
 
             handlePacket(pkt);
 
-            int pack_size = 12 + body_len;
+            int pack_size = PACKET_HEADER_SIZE + body_len;
 
-            // 把已经处理过的数据移出 buffer
+            // Preserve a trailing partial packet for the next recv call.
             memmove(buffer,
                     buffer + pack_size,
                     offset - pack_size);
@@ -443,10 +404,6 @@ void recvLoop(int client_fd)
     }
 }
 
-// ================================
-// 处理旧版鼠标点击命令
-// data 是按钮编号：1 左键，2 中键，3 右键
-// ================================
 void handleMouseClick(const char *data)
 {
     int button;
@@ -456,26 +413,22 @@ void handleMouseClick(const char *data)
 
     if (button < 1 || button > 3)
     {
-        std::cout << "非法鼠标按键:" << button << std::endl;
+        std::cout << "invalid mouse button: " << button << std::endl;
         return;
     }
 
     snprintf(cmd, sizeof(cmd), "xdotool click %d", button);
 
-    system(cmd);
+    runCommand(cmd);
 
     std::cout << "mouse click button = " << button << std::endl;
 }
 
-// ================================
-// 处理新版鼠标事件
-// 支持移动、单击、双击、滚轮
-// ================================
 void handleMouseEvent(const char *data, int len)
 {
     if (len != sizeof(MouseEvent))
     {
-        std::cout << "非法 MouseEvent 长度:" << len << std::endl;
+        std::cout << "invalid MouseEvent length: " << len << std::endl;
         return;
     }
 
@@ -493,29 +446,29 @@ void handleMouseEvent(const char *data, int len)
     if (event.action == MOUSE_ACTION_MOVE)
     {
         snprintf(cmd, sizeof(cmd), "xdotool mousemove %d %d", event.x, event.y);
-        system(cmd);
+        runCommand(cmd);
 
         std::cout << "xdotool mousemove x=" << event.x
                   << " y=" << event.y << std::endl;
     }
     else if (event.action == MOUSE_ACTION_CLICK)
     {
-        // button 1/2/3 是左右中键，4/5 是滚轮上下
+        // X11 button numbers 4 and 5 represent vertical wheel events.
         if (event.button != 1 &&
             event.button != 2 &&
             event.button != 3 &&
             event.button != 4 &&
             event.button != 5)
         {
-            std::cout << "非法鼠标按键" << std::endl;
+            std::cout << "invalid mouse button" << std::endl;
             return;
         }
 
         snprintf(cmd, sizeof(cmd), "xdotool mousemove %d %d", event.x, event.y);
-        system(cmd);
+        runCommand(cmd);
 
         snprintf(cmd, sizeof(cmd), "xdotool click %d", event.button);
-        system(cmd);
+        runCommand(cmd);
 
         std::cout << "mouse event click button=" << event.button << std::endl;
     }
@@ -525,19 +478,19 @@ void handleMouseEvent(const char *data, int len)
             event.button != 2 &&
             event.button != 3)
         {
-            std::cout << "非法双击鼠标按键" << std::endl;
+            std::cout << "invalid double-click button" << std::endl;
             return;
         }
 
         snprintf(cmd, sizeof(cmd), "xdotool mousemove %d %d", event.x, event.y);
-        system(cmd);
+        runCommand(cmd);
 
         snprintf(cmd, sizeof(cmd), "xdotool click %d", event.button);
-        system(cmd);
+        runCommand(cmd);
 
         usleep(100000);
 
-        system(cmd);
+        runCommand(cmd);
 
         std::cout << "mouse event double click button=" << event.button << std::endl;
     }
@@ -552,10 +505,10 @@ void handleMouseEvent(const char *data, int len)
         }
 
         snprintf(cmd, sizeof(cmd), "xdotool mousemove %d %d", event.x, event.y);
-        system(cmd);
+        runCommand(cmd);
 
         snprintf(cmd, sizeof(cmd), "xdotool mousedown %d", event.button);
-        system(cmd);
+        runCommand(cmd);
 
         std::cout << "mouse event down button=" << event.button << std::endl;
     }
@@ -570,10 +523,10 @@ void handleMouseEvent(const char *data, int len)
         }
 
         snprintf(cmd, sizeof(cmd), "xdotool mousemove %d %d", event.x, event.y);
-        system(cmd);
+        runCommand(cmd);
 
         snprintf(cmd, sizeof(cmd), "xdotool mouseup %d", event.button);
-        system(cmd);
+        runCommand(cmd);
 
         std::cout << "mouse event up button=" << event.button << std::endl;
     }
@@ -583,28 +536,22 @@ void handleMouseEvent(const char *data, int len)
     }
 }
 
-// ================================
-// 处理新版键盘事件
-// KEY_STATUS_DOWN：按下
-// KEY_STATUS_UP：抬起
-// ================================
 void handleKeyEvent(const char *data, int len)
 {
     if (len != sizeof(KeyEvent))
     {
-        std::cout << "非法 KeyEvent 长度:" << len << std::endl;
+        std::cout << "invalid KeyEvent length: " << len << std::endl;
         return;
     }
 
     KeyEvent event;
     memcpy(&event, data, sizeof(KeyEvent));
 
-    // 防止字符串没有结尾
-    event.key[31] = '\0';
+    event.key[sizeof(event.key) - 1] = '\0';
 
     if (event.key[0] == '\0')
     {
-        std::cout << "非法 KeyEvent: key为空" << std::endl;
+        std::cout << "invalid KeyEvent: empty key" << std::endl;
         return;
     }
 
@@ -613,27 +560,23 @@ void handleKeyEvent(const char *data, int len)
     if (event.key_status == KEY_STATUS_DOWN)
     {
         snprintf(cmd, sizeof(cmd), "xdotool keydown %s", event.key);
-        system(cmd);
+        runCommand(cmd);
 
         std::cout << "key down: " << event.key << std::endl;
     }
     else if (event.key_status == KEY_STATUS_UP)
     {
         snprintf(cmd, sizeof(cmd), "xdotool keyup %s", event.key);
-        system(cmd);
+        runCommand(cmd);
 
         std::cout << "key up: " << event.key << std::endl;
     }
     else
     {
-        std::cout << "非法 KeyEvent" << std::endl;
+        std::cout << "invalid KeyEvent status" << std::endl;
     }
 }
 
-// ================================
-// 确保完整发送 len 字节
-// send 可能一次只发送部分数据，所以需要循环发送
-// ================================
 bool sendAll(int sock, const char *buf, int len)
 {
     int total = 0;
@@ -667,9 +610,6 @@ bool sendAll(int sock, const char *buf, int len)
     return true;
 }
 
-// ================================
-// 按自定义协议编码并发送 Packet
-// ================================
 bool sendPacket(int sock, const Packet &pkt)
 {
     int len = 0;
@@ -689,15 +629,6 @@ bool sendPacket(int sock, const Packet &pkt)
     return ok;
 }
 
-// ================================
-// 捕获 Linux 当前屏幕，并通过自定义协议发送给 Windows 客户端
-//
-// 当前版本：
-// 1. 使用 XShm 获取整张原始桌面截图
-// 2. 根据 XImage 字节序与 RGB mask 转换为连续 RGB
-// 3. 在内存中编码 quality=75 的 JPEG
-// 4. 使用 SCREEN_BEGIN / SCREEN_CHUNK / SCREEN_END 分包发送
-// ================================
 bool sendRealScreenFrame(
     int client_fd,
     int frame_id,
@@ -713,10 +644,7 @@ bool sendRealScreenFrame(
     static int previous_width = 0;
     static int previous_height = 0;
 
-    // ================================
-    // XShm 相关对象只初始化一次
-    // 后续每一帧复用同一块共享内存
-    // ================================
+    // XShm objects are tied to the display, so reuse them for the connection.
     static Display* display = NULL;
     static Window root = 0;
     static int width = 0;
@@ -751,7 +679,6 @@ bool sendRealScreenFrame(
         Visual* visual = DefaultVisual(display, screen);
         int depth = DefaultDepth(display, screen);
 
-        // 创建基于共享内存的 XImage
         image = XShmCreateImage(
             display,
             visual,
@@ -769,7 +696,6 @@ bool sendRealScreenFrame(
             return false;
         }
 
-        // 为 XImage 分配共享内存
         int shm_size = image->bytes_per_line * image->height;
 
         shminfo.shmid = shmget(
@@ -800,7 +726,6 @@ bool sendRealScreenFrame(
         image->data = shminfo.shmaddr;
         shminfo.readOnly = False;
 
-        // 把共享内存挂到 X server
         if (!XShmAttach(display, &shminfo))
         {
             std::cout << "XShmAttach failed" << std::endl;
@@ -811,8 +736,8 @@ bool sendRealScreenFrame(
             return false;
         }
 
-        // 标记这块共享内存可删除
-        // 进程结束或 detach 后系统会自动回收，避免残留 shm 段
+        // The segment remains usable until it is detached, but no stale
+        // System V shared-memory object is left behind if the process exits.
         shmctl(shminfo.shmid, IPC_RMID, 0);
 
         XSync(display, False);
@@ -826,10 +751,6 @@ bool sendRealScreenFrame(
                   << std::endl;
     }
 
-    // ================================
-    // 1. 使用 XShmGetImage 抓取当前桌面
-    // 比 XGetImage 少一次普通跨进程拷贝
-    // ================================
     if (!XShmGetImage(display, root, image, 0, 0, AllPlanes))
     {
         std::cout << "XShmGetImage failed" << std::endl;
@@ -849,7 +770,7 @@ bool sendRealScreenFrame(
     int rgb_size = static_cast<int>(rgb_size64);
     std::vector<unsigned char> rgb(rgb_size);
 
-    // Respect XImage storage and channel masks rather than assuming BGRX.
+    // XImage byte order and color masks vary by visual; do not assume BGRX.
     int bytes_per_pixel = (image->bits_per_pixel + 7) / 8;
     if (bytes_per_pixel <= 0
         || bytes_per_pixel > static_cast<int>(sizeof(unsigned long))
@@ -886,6 +807,8 @@ bool sendRealScreenFrame(
         && previous_frame.size() == rgb.size()
         && memcmp(previous_frame.data(), rgb.data(), rgb.size()) == 0)
     {
+        // Avoid sending duplicate desktop frames while keeping the capture loop
+        // responsive enough to notice the next change.
         return true;
     }
 
@@ -910,9 +833,6 @@ bool sendRealScreenFrame(
 
     int total_size = static_cast<int>(jpeg.size());
 
-    // ================================
-    // 4. 构造屏幕帧头信息
-    // ================================
     ScreenFrameInfo info = {};
     info.frame_id = frame_id;
     info.width = width;
@@ -933,11 +853,6 @@ bool sendRealScreenFrame(
         return false;
     }
 
-    // ================================
-    // 5. 分包发送图像数据
-    // 每个包结构：
-    // [ Packet Header ][ ScreenChunkHeader ][ 图像数据片段 ]
-    // ================================
     int header_size = sizeof(ScreenChunkHeader);
     int max_payload = PACKET_DATA_SIZE - header_size;
     int offset = 0;
@@ -976,10 +891,6 @@ bool sendRealScreenFrame(
         chunk_count++;
     }
 
-    // ================================
-    // 6. 发送 SCREEN_END
-    // 通知 Windows 当前帧已经发完
-    // ================================
     Packet end_pkt = {};
     end_pkt.magic = PACKET_MAGIC;
     end_pkt.cmd = CMD_SCREEN_END;
@@ -1000,9 +911,6 @@ bool sendRealScreenFrame(
     ).count();
     frame_sent = true;
 
-    // ================================
-    // 7. 每 10 帧打印一次性能统计
-    // ================================
     static int debug_frame_count = 0;
     debug_frame_count++;
 

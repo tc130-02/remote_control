@@ -32,9 +32,6 @@
 
 #include "../common/packet.h"
 
-// ================================
-// 全局变量：屏幕帧接收状态
-// ================================
 const long long MAX_PROTOCOL_FRAME_SIZE = INT_MAX;
 
 std::vector<unsigned char> g_receive_frame_buffer;
@@ -144,9 +141,6 @@ uint64_t g_scale_serial = 0;
 ScaleRequest g_scale_request;
 ScaledScreenFrame g_scaled_screen_frame;
 
-// ================================
-// 全局变量：X11 显示窗口状态
-// ================================
 Display* g_display = nullptr;
 Window g_window = 0;
 GC g_gc = 0;
@@ -201,9 +195,6 @@ int g_pending_mouse_y = 0;
 std::chrono::steady_clock::time_point g_last_mouse_send_time =
     std::chrono::steady_clock::now() - std::chrono::milliseconds(100);
 
-// ================================
-// 函数声明
-// ================================
 bool sendAll(int sock, const char* buf, int len);
 bool sendPacket(int sock, const Packet& pkt);
 std::string getServerConfigPath();
@@ -713,10 +704,6 @@ void cancelConnectThread()
     g_connecting = false;
 }
 
-// ================================
-// 函数功能：确保完整发送 len 字节
-// 说明：send 不保证一次把所有数据都发出去，所以需要循环发送
-// ================================
 bool sendAll(int sock, const char* buf, int len)
 {
     int total = 0;
@@ -737,9 +724,6 @@ bool sendAll(int sock, const char* buf, int len)
     return true;
 }
 
-// ================================
-// 函数功能：把 Packet 编码成字节流后发送
-// ================================
 bool sendPacket(int sock, const Packet& pkt)
 {
     int len = 0;
@@ -758,10 +742,6 @@ bool sendPacket(int sock, const Packet& pkt)
     return ok;
 }
 
-// ================================
-// 函数功能：构造字符串类型 Packet
-// 适用场景：CMD_HELLO 这类 data 是普通字符串的命令
-// ================================
 Packet buildPacket(int cmd, const char* msg)
 {
     Packet pkt;
@@ -790,10 +770,6 @@ Packet buildPacket(int cmd, const char* msg)
     return pkt;
 }
 
-// ================================
-// 函数功能：构造二进制类型 Packet
-// 适用场景：KeyEvent、MouseEvent、ScreenFrameInfo 这类结构体数据
-// ================================
 Packet buildRawPacket(int cmd, const char* buffer, int len)
 {
     Packet pkt;
@@ -821,9 +797,6 @@ Packet buildRawPacket(int cmd, const char* buffer, int len)
     return pkt;
 }
 
-// ================================
-// 函数功能：发送键盘按下/抬起事件给 Windows server
-// ================================
 void sendKeyEvent(int sock, int key_status, const char* key)
 {
     if (key == nullptr)
@@ -846,10 +819,6 @@ void sendKeyEvent(int sock, int key_status, const char* key)
     sendPacket(sock, pkt);
 }
 
-// ================================
-// 函数功能：发送一次完整按键点击事件
-// 说明：一次点击 = keydown + 短暂等待 + keyup
-// ================================
 void sendKeyClick(int sock, const char* key)
 {
     if (key == nullptr)
@@ -862,12 +831,6 @@ void sendKeyClick(int sock, const char* key)
     sendKeyEvent(sock, KEY_STATUS_UP, key);
 }
 
-// ================================
-// 函数功能：发送鼠标事件给 Windows server
-// 说明：
-//   Linux client 将鼠标动作封装成 MouseEvent，
-//   通过 CMD_MOUSE_EVENT 发送给 Windows server 执行。
-// ================================
 void sendMouseEvent(int sock, int action, int button, int x, int y)
 {
     MouseEvent event = {};
@@ -885,7 +848,7 @@ void sendMouseEvent(int sock, int action, int button, int x, int y)
 
     sendPacket(sock, pkt);
 
-    // 鼠标移动事件非常高频，不打印移动日志，避免终端刷屏和卡顿。
+    // Mouse movement is high-frequency, so only discrete actions are logged.
     if (action != MOUSE_ACTION_MOVE)
     {
         std::cout << "mouse event action=" << action
@@ -896,12 +859,6 @@ void sendMouseEvent(int sock, int action, int button, int x, int y)
     }
 }
 
-// ================================
-// 函数功能：将 Linux client 窗口坐标换算成远程 Windows 屏幕坐标
-// 说明：
-//   g_window_width / g_window_height 是本地显示窗口大小。
-//   g_frame_width / g_frame_height 是远程 Windows 原始屏幕大小。
-// ================================
 bool convertLocalToRemote(int local_x, int local_y, int& remote_x, int& remote_y)
 {
     if (g_window_width <= 0 || g_window_height <= 0)
@@ -952,12 +909,6 @@ bool convertLocalToRemote(int local_x, int local_y, int& remote_x, int& remote_y
     return true;
 }
 
-// ================================
-// 函数功能：处理 Linux client 窗口中的 X11 输入事件
-// 说明：
-//   当前用于捕获用户在远程屏幕窗口中的鼠标移动和点击，
-//   并把窗口坐标转换为 Windows 屏幕坐标后发送给 Windows server。
-// ================================
 void handleX11Events(int sock)
 {
     if (g_display == nullptr || g_window == 0)
@@ -1176,10 +1127,6 @@ void handleConnectionEvent(const XEvent& event)
     drawConnectionInterface();
 }
 
-// ================================
-// 函数功能：处理 Windows server 发来的 SCREEN_BEGIN 包
-// 作用：读取当前屏幕帧的基本信息，并准备接收缓冲区
-// ================================
 void discardReceivingFrame()
 {
     g_receive_frame_buffer.clear();
@@ -1414,6 +1361,9 @@ void screenScaleLoop()
         }
         scaled.bgra.resize(static_cast<size_t>(scaled_size));
 
+        // Build pixels in the active X11 visual's native byte order and masks.
+        // The source remains full-resolution BGRA; only this display buffer is
+        // resized.
         const std::vector<unsigned char>& source = *request.bgra;
         if (static_cast<long long>(source.size())
             != 1LL * request.width * request.height * 4)
@@ -1629,6 +1579,8 @@ void screenDecodeLoop()
             }
 
             decoded.bgra.resize((size_t)decoded_size);
+            // stb returns RGBA. The shared decoded representation is BGRA so
+            // both the legacy path and the scaling path use the same layout.
             for (long long pixel = 0;
                  pixel < 1LL * decoded_width * decoded_height;
                  ++pixel)
@@ -1801,7 +1753,7 @@ void displayLatestScaledFrame()
 
 void handleScreenBegin(const Packet& pkt)
 {
-    // A new frame supersedes any older frame that did not reach SCREEN_END.
+    // SCREEN_BEGIN is also the recovery point for an interrupted older frame.
     discardReceivingFrame();
 
     if (pkt.body_len != sizeof(ScreenFrameInfo))
@@ -1857,10 +1809,6 @@ void handleScreenBegin(const Packet& pkt)
     g_receiving_frame = true;
 }
 
-// ================================
-// 函数功能：处理 Windows server 发来的 SCREEN_CHUNK 包
-// 作用：把当前图像分块复制到整帧缓冲区对应 offset 位置
-// ================================
 void handleScreenChunk(const Packet& pkt)
 {
     if (!g_receiving_frame)
@@ -1919,10 +1867,6 @@ void handleScreenChunk(const Packet& pkt)
     g_receive_frame_received_size += header.data_len;
 }
 
-// ================================
-// 函数功能：处理 Windows server 发来的 SCREEN_END 包
-// 作用：判断当前帧是否接收完整，完整后初始化窗口并绘制屏幕帧
-// ================================
 void handleScreenEnd(const Packet& pkt)
 {
     if (pkt.body_len != sizeof(int32_t))
@@ -1967,8 +1911,8 @@ void handleScreenEnd(const Packet& pkt)
     {
         std::lock_guard<std::mutex> lock(g_screen_frame_mutex);
         completed.generation = g_screen_generation;
-        // This is intentionally a single-slot queue. A newer complete screen
-        // frame replaces an older one that the decoder has not started yet.
+        // Keep one pending frame: latency matters more than displaying every
+        // historical frame, while control packets still use the normal path.
         g_pending_screen_frame = std::move(completed);
         g_pending_screen_frame_ready = true;
     }
@@ -1977,15 +1921,6 @@ void handleScreenEnd(const Packet& pkt)
     discardReceivingFrame();
 }
 
-// ================================
-// 函数功能：根据 Packet 的 cmd 字段分发不同命令
-// 当前 Linux client 只接收 Windows server 发来的：
-//   1. CMD_HELLO
-//   2. CMD_SCREEN_BEGIN
-//   3. CMD_SCREEN_CHUNK
-//   4. CMD_SCREEN_END
-// 不在这里写鼠标/键盘分发，因为键鼠事件是 Linux client 发给 Windows server 的
-// ================================
 void handlePacket(const Packet& pkt)
 {
     if (pkt.magic != PACKET_MAGIC)
@@ -2022,14 +1957,8 @@ void handlePacket(const Packet& pkt)
     }
 }
 
-// ================================
-// 函数功能：循环接收 Windows server 发来的数据，并处理 TCP 粘包/半包
-// 说明：TCP 是字节流，一次 recv 不一定刚好等于一个 Packet
-// ================================
 void recvLoop(int sock)
 {
-    const int HEADER_SIZE = 12;
-
     char buffer[262144] = {0};
     int offset = 0;
 
@@ -2099,7 +2028,7 @@ void recvLoop(int sock)
 
         offset += len;
 
-        while (offset >= HEADER_SIZE)
+        while (offset >= PACKET_HEADER_SIZE)
         {
             int body_len = 0;
             memcpy(&body_len, buffer + 8, sizeof(int));
@@ -2110,7 +2039,7 @@ void recvLoop(int sock)
                 return;
             }
 
-            int packet_size = HEADER_SIZE + body_len;
+            int packet_size = PACKET_HEADER_SIZE + body_len;
 
             if (offset < packet_size)
             {
@@ -2410,12 +2339,6 @@ void drawConnectionInterface()
     XFlush(g_display);
 }
 
-// ================================
-// 函数功能：将接收到的屏幕帧绘制到 Linux client 的 X11 窗口
-// 说明：
-//   后台线程按当前窗口尺寸生成等比例 XImage 原生像素缓冲区。
-//   X11 线程只清理黑色背景并绘制最近准备好的显示帧。
-// ================================
 void drawFrameToWindow()
 {
     if (g_display == nullptr || g_window == 0 || g_gc == 0)
@@ -2500,6 +2423,8 @@ void drawFrameToWindow()
 
     XFlush(g_display);
 
+    // XCreateImage borrows the vector storage; prevent XDestroyImage from
+    // freeing memory owned by the vector.
     image->data = nullptr;
     XDestroyImage(image);
 }
@@ -2546,9 +2471,6 @@ void resetRemoteState()
     g_mouse_move_pending = false;
 }
 
-// ================================
-// 函数功能：关闭 Linux client 的 X11 显示窗口并释放资源
-// ================================
 void closeDisplayWindow()
 {
     if (g_display == nullptr)

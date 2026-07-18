@@ -104,6 +104,7 @@ std::thread g_screen_decode_thread;
 std::mutex g_screen_decode_mutex;
 std::condition_variable g_screen_decode_condition;
 bool g_screen_decode_running = false;
+// The pending slot is overwritten by newer complete frames to bound latency.
 bool g_pending_screen_frame_ready = false;
 int g_screen_generation = 0;
 QueuedScreenFrame g_pending_screen_frame;
@@ -764,6 +765,7 @@ void ResetRemoteScreenState()
 
     {
         std::lock_guard<std::mutex> lock(g_screen_decode_mutex);
+        // Invalidates work decoded for a connection that has already closed.
         ++g_screen_generation;
         g_pending_screen_frame = QueuedScreenFrame();
         g_pending_screen_frame_ready = false;
@@ -879,6 +881,7 @@ void ScreenDecodeLoop()
 
             auto prepare_start = std::chrono::steady_clock::now();
             bgra.resize(static_cast<size_t>(decoded_size));
+            // stb returns RGBA; StretchDIBits consumes a top-down BGRA DIB.
             for (long long pixel = 0;
                  pixel < 1LL * decoded_width * decoded_height;
                  ++pixel) {
@@ -1424,7 +1427,7 @@ void recvThreadProc(SOCKET connected_socket)
         offset += len;
 
         while (true) {
-            if (offset < 12) {
+            if (offset < PACKET_HEADER_SIZE) {
                 break;
             }
 
@@ -1437,14 +1440,14 @@ void recvThreadProc(SOCKET connected_socket)
                 break;
             }
 
-            if (offset < 12 + body_len) {
+            if (offset < PACKET_HEADER_SIZE + body_len) {
                 break;
             }
 
             Packet pkt = decodePacket(buffer);
             handleIncomingPacket(pkt);
 
-            int pack_size = 12 + body_len;
+            int pack_size = PACKET_HEADER_SIZE + body_len;
 
             memmove(buffer, buffer + pack_size, offset - pack_size);
             offset -= pack_size;
@@ -1504,6 +1507,7 @@ void handleIncomingPacket(const Packet& pkt)
 
 void handleScreenBegin(const Packet& pkt)
 {
+    // A new begin packet is the recovery point for an interrupted older frame.
     DiscardReceivingFrame();
 
     if (pkt.body_len != sizeof(ScreenFrameInfo)) {
@@ -1638,6 +1642,7 @@ void handleScreenEnd(const Packet& pkt)
     {
         std::lock_guard<std::mutex> lock(g_screen_decode_mutex);
         completed.generation = g_screen_generation;
+        // Replace an undecoded frame instead of building a display backlog.
         g_pending_screen_frame = std::move(completed);
         g_pending_screen_frame_ready = true;
     }
@@ -1698,6 +1703,7 @@ void drawRemoteScreen(HDC hdc, RECT client_rect)
     bmi.bmiHeader.biBitCount = 32;
     bmi.bmiHeader.biCompression = BI_RGB;
 
+    // Scaling only affects presentation; the decoded frame keeps remote size.
     SetStretchBltMode(hdc, HALFTONE);
     SetBrushOrgEx(hdc, g_display_x, g_display_y, NULL);
     StretchDIBits(

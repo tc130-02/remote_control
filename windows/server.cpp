@@ -370,7 +370,7 @@ void recvLoop(SOCKET client_socket)
         offset += len;
 
         while (true) {
-            if (offset < 12) {
+            if (offset < PACKET_HEADER_SIZE) {
                 break;
             }
 
@@ -391,14 +391,14 @@ void recvLoop(SOCKET client_socket)
                 break;
             }
 
-            if (offset < 12 + body_len) {
+            if (offset < PACKET_HEADER_SIZE + body_len) {
                 break;
             }
 
             Packet pkt = decodePacket(buffer);
             handlePacket(pkt);
 
-            int pack_size = 12 + body_len;
+            int pack_size = PACKET_HEADER_SIZE + body_len;
             memmove(buffer, buffer + pack_size, offset - pack_size);
             offset -= pack_size;
         }
@@ -556,10 +556,6 @@ void handleMouseEvent(const char* data, int len)
         return;
     }
 
-    // std::cout << "mouse event action=" << event.action
-    //           << " button=" << event.button
-    //           << " x=" << event.x
-    //           << " y=" << event.y << std::endl;
 }
 
 bool keyNameToVk(const char* key, WORD& vk)
@@ -731,6 +727,8 @@ bool sendRealScreenFrame(
     bmi.bmiHeader.biBitCount = 32;
     bmi.bmiHeader.biCompression = BI_RGB;
 
+    // A negative DIB height gives a top-down BGRA buffer, matching the
+    // coordinate system used by the clients.
     void* bits = nullptr;
     HBITMAP bitmap = CreateDIBSection(screen_dc, &bmi, DIB_RGB_COLORS, &bits, NULL, 0);
     if (bitmap == NULL || bits == nullptr) {
@@ -771,6 +769,7 @@ bool sendRealScreenFrame(
         return true;
     }
 
+    // stb_image_write expects RGB here; a Windows 32-bit DIB is BGRA.
     std::vector<unsigned char> rgb(1LL * width * height * 3);
     for (int pixel = 0; pixel < width * height; ++pixel) {
         int bgra_index = pixel * 4;
