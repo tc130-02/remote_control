@@ -44,7 +44,8 @@ enum KeyStatus {
 };
 
 enum RemoteScreenFormat {
-    SCREEN_FORMAT_BGRA32 = 1
+    SCREEN_FORMAT_BGRA32 = 0,
+    SCREEN_FORMAT_JPEG = 1
 };
 
 struct MouseEvent {

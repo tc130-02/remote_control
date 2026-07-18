@@ -16,6 +16,10 @@
 #include <algorithm>
 #include <chrono>
 #include <string>
+#include <climits>
+
+#define STB_IMAGE_WRITE_IMPLEMENTATION
+#include "../third_party/stb_image_write.h"
 
 #pragma comment(lib, "ws2_32.lib")
 #pragma comment(lib, "gdi32.lib")
@@ -25,10 +29,9 @@
 
 const int SERVER_PORT = 9999;
 const int RECV_BUFFER_SIZE = 262144;
-const int MAX_SCREEN_SIZE = 100 * 1024 * 1024;
-const int MIN_FRAME_INTERVAL_MS = 50;
-const int UNCHANGED_FRAME_INTERVAL_MS = 100;
-const int MAX_FRAME_INTERVAL_MS = 1000;
+const long long MAX_PROTOCOL_FRAME_SIZE = INT_MAX;
+const int FRAME_INTERVAL_MS = 100;
+const int JPEG_QUALITY = 75;
 
 SOCKET g_server_socket = INVALID_SOCKET;
 SOCKET g_client_socket = INVALID_SOCKET;
@@ -39,11 +42,11 @@ void printLocalIPv4Addresses(int port);
 SOCKET acceptClient(SOCKET server_socket);
 void recvLoop(SOCKET client_socket);
 void screenSendLoop(SOCKET client_socket);
+void writeJpegToVector(void* context, void* data, int size);
 bool sendRealScreenFrame(
     SOCKET client_socket,
     int frame_id,
-    bool& frame_sent,
-    long long& send_ms
+    bool& frame_sent
 );
 
 Packet buildPacket(int cmd, const char* msg);
@@ -655,15 +658,25 @@ void handleKeyEvent(const char* data, int len)
     }
 }
 
+void writeJpegToVector(void* context, void* data, int size)
+{
+    if (context == nullptr || data == nullptr || size <= 0) {
+        return;
+    }
+
+    std::vector<unsigned char>* output =
+        static_cast<std::vector<unsigned char>*>(context);
+    const unsigned char* bytes = static_cast<const unsigned char*>(data);
+    output->insert(output->end(), bytes, bytes + size);
+}
+
 bool sendRealScreenFrame(
     SOCKET client_socket,
     int frame_id,
-    bool& frame_sent,
-    long long& send_ms
+    bool& frame_sent
 )
 {
     frame_sent = false;
-    send_ms = 0;
 
     auto t0 = std::chrono::steady_clock::now();
     static std::vector<unsigned char> previous_frame;
@@ -679,13 +692,13 @@ bool sendRealScreenFrame(
     }
 
     long long total64 = 1LL * width * height * 4;
-    if (total64 <= 0 || total64 > MAX_SCREEN_SIZE) {
+    if (total64 <= 0 || total64 > MAX_PROTOCOL_FRAME_SIZE) {
         std::cout << "screen frame too large: " << total64 << std::endl;
         return false;
     }
 
-    int total_size = (int)total64;
-    std::vector<unsigned char> frame(total_size);
+    int raw_size = (int)total64;
+    std::vector<unsigned char> frame(raw_size);
 
     HDC screen_dc = GetDC(NULL);
     if (screen_dc == NULL) {
@@ -721,7 +734,6 @@ bool sendRealScreenFrame(
     HGDIOBJ old_bitmap = SelectObject(mem_dc, bitmap);
 
     BOOL ok = BitBlt(mem_dc, 0, 0, width, height, screen_dc, 0, 0, SRCCOPY | CAPTUREBLT);
-    auto t1 = std::chrono::steady_clock::now();
 
     if (!ok) {
         std::cout << "BitBlt failed" << std::endl;
@@ -732,17 +744,16 @@ bool sendRealScreenFrame(
         return false;
     }
 
-    memcpy(frame.data(), bits, total_size);
-    for (int i = 3; i < total_size; i += 4) {
+    memcpy(frame.data(), bits, raw_size);
+    for (int i = 3; i < raw_size; i += 4) {
         frame[i] = 255;
     }
-
-    auto t2 = std::chrono::steady_clock::now();
 
     SelectObject(mem_dc, old_bitmap);
     DeleteObject(bitmap);
     DeleteDC(mem_dc);
     ReleaseDC(NULL, screen_dc);
+    auto t1 = std::chrono::steady_clock::now();
 
     if (previous_width == width
         && previous_height == height
@@ -751,12 +762,41 @@ bool sendRealScreenFrame(
         return true;
     }
 
+    std::vector<unsigned char> rgb(1LL * width * height * 3);
+    for (int pixel = 0; pixel < width * height; ++pixel) {
+        int bgra_index = pixel * 4;
+        int rgb_index = pixel * 3;
+        rgb[rgb_index + 0] = frame[bgra_index + 2];
+        rgb[rgb_index + 1] = frame[bgra_index + 1];
+        rgb[rgb_index + 2] = frame[bgra_index + 0];
+    }
+    auto t2 = std::chrono::steady_clock::now();
+
+    std::vector<unsigned char> jpeg;
+    jpeg.reserve(std::max(1024LL, 1LL * width * height));
+    int encode_ok = stbi_write_jpg_to_func(
+        writeJpegToVector,
+        &jpeg,
+        width,
+        height,
+        3,
+        rgb.data(),
+        JPEG_QUALITY
+    );
+    auto t3 = std::chrono::steady_clock::now();
+
+    if (encode_ok == 0 || jpeg.empty() || jpeg.size() > INT_MAX) {
+        std::cout << "JPEG memory encoding failed" << std::endl;
+        return false;
+    }
+
+    int total_size = (int)jpeg.size();
     ScreenFrameInfo info = {};
     info.frame_id = frame_id;
     info.width = width;
     info.height = height;
     info.total_size = total_size;
-    info.format = SCREEN_FORMAT_BGRA32;
+    info.format = SCREEN_FORMAT_JPEG;
 
     Packet begin_pkt = buildRawPacket(CMD_SCREEN_BEGIN, (const char*)&info, sizeof(info));
     if (!sendPacket(client_socket, begin_pkt)) {
@@ -785,7 +825,7 @@ bool sendRealScreenFrame(
         header.data_len = data_len;
 
         memcpy(chunk_pkt.data, &header, header_size);
-        memcpy(chunk_pkt.data + header_size, frame.data() + offset, data_len);
+        memcpy(chunk_pkt.data + header_size, jpeg.data() + offset, data_len);
 
         if (!sendPacket(client_socket, chunk_pkt)) {
             std::cout << "send screen chunk failed" << std::endl;
@@ -802,13 +842,8 @@ bool sendRealScreenFrame(
         return false;
     }
 
-    auto t3 = std::chrono::steady_clock::now();
-    send_ms = std::chrono::duration_cast<std::chrono::milliseconds>(t3 - t2).count();
+    auto t4 = std::chrono::steady_clock::now();
     frame_sent = true;
-
-    previous_frame.swap(frame);
-    previous_width = width;
-    previous_height = height;
 
     static int debug_frame_count = 0;
     debug_frame_count++;
@@ -816,16 +851,27 @@ bool sendRealScreenFrame(
     if (debug_frame_count % 10 == 0) {
         auto capture_ms = std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count();
         auto convert_ms = std::chrono::duration_cast<std::chrono::milliseconds>(t2 - t1).count();
-        auto measured_send_ms = std::chrono::duration_cast<std::chrono::milliseconds>(t3 - t2).count();
-        auto total_ms = std::chrono::duration_cast<std::chrono::milliseconds>(t3 - t0).count();
+        auto encode_ms = std::chrono::duration_cast<std::chrono::milliseconds>(t3 - t2).count();
+        auto measured_send_ms = std::chrono::duration_cast<std::chrono::milliseconds>(t4 - t3).count();
+        double compression_ratio = jpeg.empty()
+            ? 0.0
+            : (double)raw_size / (double)jpeg.size();
 
-        std::cout << "[frame " << frame_id << "] "
-                  << "capture=" << capture_ms << "ms, "
-                  << "convert=" << convert_ms << "ms, "
-                  << "send=" << measured_send_ms << "ms, "
-                  << "total=" << total_ms << "ms, "
-                  << "chunks=" << chunk_count << std::endl;
+        std::cout << "[screen] frame_id=" << frame_id
+                  << " capture_ms=" << capture_ms
+                  << " color_convert_ms=" << convert_ms
+                  << " jpeg_encode_ms=" << encode_ms
+                  << " send_ms=" << measured_send_ms
+                  << " raw_size=" << raw_size
+                  << " jpeg_size=" << jpeg.size()
+                  << " compression_ratio=" << compression_ratio
+                  << " chunk_count=" << chunk_count
+                  << std::endl;
     }
+
+    previous_frame.swap(frame);
+    previous_width = width;
+    previous_height = height;
 
     return true;
 }
@@ -833,46 +879,23 @@ bool sendRealScreenFrame(
 void screenSendLoop(SOCKET client_socket)
 {
     int frame_id = 1;
-    long long average_send_ms = 0;
 
     while (g_running) {
         auto loop_start = std::chrono::steady_clock::now();
         bool frame_sent = false;
-        long long send_ms = 0;
 
         if (!sendRealScreenFrame(
                 client_socket,
                 frame_id,
-                frame_sent,
-                send_ms
+                frame_sent
             )) {
             g_running = false;
             shutdown(client_socket, SD_BOTH);
             break;
         }
 
-        int target_interval_ms = UNCHANGED_FRAME_INTERVAL_MS;
-
         if (frame_sent) {
             frame_id++;
-
-            long long measured_send_ms = std::max(1LL, send_ms);
-            if (average_send_ms == 0) {
-                average_send_ms = measured_send_ms;
-            }
-            else {
-                average_send_ms = (average_send_ms * 3 + measured_send_ms) / 4;
-            }
-
-            long long adaptive_interval = average_send_ms * 5 / 4;
-            adaptive_interval = std::max(
-                (long long)MIN_FRAME_INTERVAL_MS,
-                std::min(
-                    (long long)MAX_FRAME_INTERVAL_MS,
-                    adaptive_interval
-                )
-            );
-            target_interval_ms = (int)adaptive_interval;
         }
 
         auto loop_end = std::chrono::steady_clock::now();
@@ -880,9 +903,9 @@ void screenSendLoop(SOCKET client_socket)
             loop_end - loop_start
         ).count();
 
-        if (loop_ms < target_interval_ms) {
+        if (loop_ms < FRAME_INTERVAL_MS) {
             std::this_thread::sleep_for(
-                std::chrono::milliseconds(target_interval_ms - loop_ms)
+                std::chrono::milliseconds(FRAME_INTERVAL_MS - loop_ms)
             );
         }
     }
