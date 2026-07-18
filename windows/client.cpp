@@ -17,8 +17,17 @@
 #include <mutex>
 #include <atomic>
 #include <algorithm>
+#include <condition_variable>
+#include <chrono>
+#include <climits>
+#include <memory>
 
+#define STB_IMAGE_IMPLEMENTATION
+#include "../third_party/stb_image.h"
+
+#if defined(_MSC_VER)
 #pragma comment(lib, "ws2_32.lib")
+#endif
 
 #include "../common/packet.h"
 
@@ -38,14 +47,12 @@ const int IDC_PORT_EDIT = 1002;
 const int IDC_CONNECT_BUTTON = 1003;
 const UINT WM_APP_CONNECT_COMPLETE = WM_APP + 1;
 const UINT WM_APP_CONNECTION_LOST = WM_APP + 2;
+const UINT WM_APP_SCREEN_READY = WM_APP + 3;
 
 std::string g_default_host;
 std::string g_default_port;
 std::string g_attempt_host;
 std::string g_attempt_port;
-
-int g_remote_width = 1918;
-int g_remote_height = 918;
 
 int g_last_remote_x = -1;
 int g_last_remote_y = -1;
@@ -63,9 +70,15 @@ std::thread g_connect_thread;
 std::mutex g_socket_mutex;
 
 std::mutex g_screen_mutex;
-std::vector<unsigned char> g_screen_bgra;
+std::shared_ptr<const std::vector<unsigned char>> g_screen_bgra;
 int g_screen_width = 0;
 int g_screen_height = 0;
+int g_window_width = 0;
+int g_window_height = 0;
+int g_display_x = 0;
+int g_display_y = 0;
+int g_display_width = 0;
+int g_display_height = 0;
 
 std::vector<unsigned char> g_frame_buffer;
 int g_frame_id = -1;
@@ -77,6 +90,26 @@ int g_frame_format = 0;
 int g_frame_chunk_count = 0;
 bool g_receiving_frame = false;
 
+struct QueuedScreenFrame {
+    int frame_id = -1;
+    int width = 0;
+    int height = 0;
+    int receive_size = 0;
+    int format = SCREEN_FORMAT_BGRA32;
+    int generation = 0;
+    std::vector<unsigned char> data;
+};
+
+std::thread g_screen_decode_thread;
+std::mutex g_screen_decode_mutex;
+std::condition_variable g_screen_decode_condition;
+bool g_screen_decode_running = false;
+bool g_pending_screen_frame_ready = false;
+int g_screen_generation = 0;
+QueuedScreenFrame g_pending_screen_frame;
+
+const long long MAX_PROTOCOL_FRAME_SIZE = INT_MAX;
+
 bool InitSocket();
 std::string GetServerConfigPath();
 void LoadServerConfig(std::string& host, std::string& port);
@@ -87,9 +120,23 @@ void ConnectWorker(std::string host, std::string port);
 void SetConnectionUiVisible(bool visible);
 void SetConnectionStatus(const std::string& status);
 void ResetRemoteScreenState();
+void DiscardReceivingFrame();
+void StartScreenDecodeThread();
+void StopScreenDecodeThread();
+void ScreenDecodeLoop();
 int InitWindow(HINSTANCE hInstance, int nCmdShow);
 
 bool convertToRemotePoint(HWND hwnd, int xPos, int yPos, int& remote_x, int& remote_y);
+bool calculateDisplayRect(
+    int remote_width,
+    int remote_height,
+    int window_width,
+    int window_height,
+    int& display_x,
+    int& display_y,
+    int& display_width,
+    int& display_height
+);
 
 Packet buildPacket(int cmd, const char* msg);
 Packet buildRawPacket(int cmd, const char* buffer, int len);
@@ -196,6 +243,7 @@ LRESULT CALLBACK winProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
             );
             SaveServerConfig(g_attempt_host, g_attempt_port);
             SetConnectionUiVisible(false);
+            InvalidateRect(hwnd, NULL, TRUE);
 
             SOCKET connected_socket = INVALID_SOCKET;
             {
@@ -204,6 +252,8 @@ LRESULT CALLBACK winProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
             }
 
             if (connected_socket != INVALID_SOCKET) {
+                ResetRemoteScreenState();
+                StartScreenDecodeThread();
                 sendHello(connected_socket, "hello linux window client");
                 g_running = true;
                 g_recv_thread = std::thread(
@@ -229,6 +279,7 @@ LRESULT CALLBACK winProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
             g_recv_thread.join();
         }
 
+        StopScreenDecodeThread();
         g_running = false;
         g_connected = false;
         ResetRemoteScreenState();
@@ -249,6 +300,20 @@ LRESULT CALLBACK winProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 
         InvalidateRect(hwnd, NULL, TRUE);
         SetFocus(g_host_edit);
+    }
+    break;
+
+    case WM_APP_SCREEN_READY:
+        InvalidateRect(hwnd, NULL, FALSE);
+        break;
+
+    case WM_SIZE:
+    {
+        RECT client_rect = {};
+        GetClientRect(hwnd, &client_rect);
+        g_window_width = client_rect.right - client_rect.left;
+        g_window_height = client_rect.bottom - client_rect.top;
+        InvalidateRect(hwnd, NULL, FALSE);
     }
     break;
 
@@ -471,6 +536,7 @@ LRESULT CALLBACK winProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
             g_recv_thread.join();
         }
 
+        StopScreenDecodeThread();
         WSACleanup();
         PostQuitMessage(0);
     }
@@ -490,6 +556,9 @@ int WINAPI WinMain(
     int nCmdShow
 )
 {
+    (void)hPrevInstance;
+    (void)pCmdLine;
+
     AllocConsole();
     freopen("CONOUT$", "w", stdout);
     freopen("CONOUT$", "w", stderr);
@@ -506,7 +575,7 @@ int WINAPI WinMain(
         return 0;
     }
 
-    MSG msg = { 0 };
+    MSG msg = {};
 
     while (GetMessage(&msg, NULL, 0, 0)) {
         TranslateMessage(&msg);
@@ -676,20 +745,205 @@ void SetConnectionUiVisible(bool visible)
     ShowWindow(g_status_static, command);
 }
 
-void ResetRemoteScreenState()
+void DiscardReceivingFrame()
 {
-    std::lock_guard<std::mutex> lock(g_screen_mutex);
-    g_screen_bgra.clear();
-    g_screen_width = 0;
-    g_screen_height = 0;
     g_frame_buffer.clear();
     g_frame_id = -1;
     g_frame_width = 0;
     g_frame_height = 0;
     g_frame_total_size = 0;
     g_frame_received_size = 0;
+    g_frame_format = SCREEN_FORMAT_BGRA32;
     g_frame_chunk_count = 0;
     g_receiving_frame = false;
+}
+
+void ResetRemoteScreenState()
+{
+    DiscardReceivingFrame();
+
+    {
+        std::lock_guard<std::mutex> lock(g_screen_decode_mutex);
+        ++g_screen_generation;
+        g_pending_screen_frame = QueuedScreenFrame();
+        g_pending_screen_frame_ready = false;
+    }
+
+    std::lock_guard<std::mutex> screen_lock(g_screen_mutex);
+    g_screen_bgra.reset();
+    g_screen_width = 0;
+    g_screen_height = 0;
+    g_display_x = 0;
+    g_display_y = 0;
+    g_display_width = 0;
+    g_display_height = 0;
+}
+
+void StartScreenDecodeThread()
+{
+    if (g_screen_decode_thread.joinable()) {
+        return;
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(g_screen_decode_mutex);
+        g_screen_decode_running = true;
+        g_pending_screen_frame_ready = false;
+    }
+    g_screen_decode_thread = std::thread(ScreenDecodeLoop);
+}
+
+void StopScreenDecodeThread()
+{
+    {
+        std::lock_guard<std::mutex> lock(g_screen_decode_mutex);
+        g_screen_decode_running = false;
+        g_pending_screen_frame_ready = false;
+    }
+    g_screen_decode_condition.notify_all();
+
+    if (g_screen_decode_thread.joinable()) {
+        g_screen_decode_thread.join();
+    }
+}
+
+void ScreenDecodeLoop()
+{
+    while (true) {
+        QueuedScreenFrame encoded;
+        {
+            std::unique_lock<std::mutex> lock(g_screen_decode_mutex);
+            g_screen_decode_condition.wait(
+                lock,
+                []() {
+                    return !g_screen_decode_running
+                        || g_pending_screen_frame_ready;
+                }
+            );
+
+            if (!g_screen_decode_running && !g_pending_screen_frame_ready) {
+                return;
+            }
+
+            encoded = std::move(g_pending_screen_frame);
+            g_pending_screen_frame_ready = false;
+        }
+
+        std::vector<unsigned char> bgra;
+        long long jpeg_decode_ms = 0;
+        long long display_prepare_ms = 0;
+
+        if (encoded.format == SCREEN_FORMAT_JPEG) {
+            int decoded_width = 0;
+            int decoded_height = 0;
+            int source_channels = 0;
+            auto decode_start = std::chrono::steady_clock::now();
+            unsigned char* rgba = stbi_load_from_memory(
+                encoded.data.data(),
+                static_cast<int>(encoded.data.size()),
+                &decoded_width,
+                &decoded_height,
+                &source_channels,
+                4
+            );
+            auto decode_end = std::chrono::steady_clock::now();
+            jpeg_decode_ms =
+                std::chrono::duration_cast<std::chrono::milliseconds>(
+                    decode_end - decode_start
+                ).count();
+
+            if (rgba == nullptr) {
+                const char* reason = stbi_failure_reason();
+                std::cout << "JPEG decode failed frame_id="
+                          << encoded.frame_id << " reason="
+                          << (reason == nullptr ? "unknown" : reason)
+                          << std::endl;
+                continue;
+            }
+
+            if (decoded_width != encoded.width
+                || decoded_height != encoded.height) {
+                std::cout << "JPEG dimensions mismatch frame_id="
+                          << encoded.frame_id << std::endl;
+                stbi_image_free(rgba);
+                continue;
+            }
+
+            long long decoded_size =
+                1LL * decoded_width * decoded_height * 4;
+            if (decoded_size <= 0
+                || decoded_size > MAX_PROTOCOL_FRAME_SIZE) {
+                stbi_image_free(rgba);
+                continue;
+            }
+
+            auto prepare_start = std::chrono::steady_clock::now();
+            bgra.resize(static_cast<size_t>(decoded_size));
+            for (long long pixel = 0;
+                 pixel < 1LL * decoded_width * decoded_height;
+                 ++pixel) {
+                long long index = pixel * 4;
+                bgra[index + 0] = rgba[index + 2];
+                bgra[index + 1] = rgba[index + 1];
+                bgra[index + 2] = rgba[index + 0];
+                bgra[index + 3] = 255;
+            }
+            stbi_image_free(rgba);
+            auto prepare_end = std::chrono::steady_clock::now();
+            display_prepare_ms =
+                std::chrono::duration_cast<std::chrono::milliseconds>(
+                    prepare_end - prepare_start
+                ).count();
+        }
+        else if (encoded.format == SCREEN_FORMAT_BGRA32) {
+            long long expected_size =
+                1LL * encoded.width * encoded.height * 4;
+            if (static_cast<long long>(encoded.data.size())
+                != expected_size) {
+                continue;
+            }
+            bgra = std::move(encoded.data);
+        }
+        else {
+            continue;
+        }
+
+        {
+            std::lock_guard<std::mutex> decode_lock(g_screen_decode_mutex);
+            if (encoded.generation != g_screen_generation) {
+                continue;
+            }
+            if (g_pending_screen_frame_ready
+                && g_pending_screen_frame.generation == encoded.generation
+                && g_pending_screen_frame.frame_id > encoded.frame_id) {
+                continue;
+            }
+
+            std::lock_guard<std::mutex> screen_lock(g_screen_mutex);
+            g_screen_bgra =
+                std::make_shared<const std::vector<unsigned char>>(
+                    std::move(bgra)
+                );
+            g_screen_width = encoded.width;
+            g_screen_height = encoded.height;
+        }
+
+        static int prepared_frame_count = 0;
+        ++prepared_frame_count;
+        if (prepared_frame_count % 10 == 0) {
+            std::cout << "[screen] frame_id=" << encoded.frame_id
+                      << " receive_size=" << encoded.receive_size
+                      << " jpeg_decode_ms=" << jpeg_decode_ms
+                      << " display_prepare_ms=" << display_prepare_ms
+                      << " width=" << encoded.width
+                      << " height=" << encoded.height
+                      << std::endl;
+        }
+
+        if (g_hwnd != NULL) {
+            PostMessage(g_hwnd, WM_APP_SCREEN_READY, 0, 0);
+        }
+    }
 }
 
 void StartConnect()
@@ -854,6 +1108,47 @@ void ConnectWorker(std::string host, std::string port)
     PostMessage(g_hwnd, WM_APP_CONNECT_COMPLETE, TRUE, 0);
 }
 
+bool calculateDisplayRect(
+    int remote_width,
+    int remote_height,
+    int window_width,
+    int window_height,
+    int& display_x,
+    int& display_y,
+    int& display_width,
+    int& display_height
+)
+{
+    if (remote_width <= 0 || remote_height <= 0
+        || window_width <= 0 || window_height <= 0) {
+        return false;
+    }
+
+    if (1LL * window_width * remote_height
+        <= 1LL * window_height * remote_width) {
+        display_width = window_width;
+        display_height = std::max(
+            1,
+            static_cast<int>(
+                1LL * window_width * remote_height / remote_width
+            )
+        );
+    }
+    else {
+        display_height = window_height;
+        display_width = std::max(
+            1,
+            static_cast<int>(
+                1LL * window_height * remote_width / remote_height
+            )
+        );
+    }
+
+    display_x = (window_width - display_width) / 2;
+    display_y = (window_height - display_height) / 2;
+    return true;
+}
+
 bool convertToRemotePoint(HWND hwnd, int xPos, int yPos, int& remote_x, int& remote_y)
 {
     RECT client_rect;
@@ -866,19 +1161,54 @@ bool convertToRemotePoint(HWND hwnd, int xPos, int yPos, int& remote_x, int& rem
         return false;
     }
 
-    int target_width = g_remote_width;
-    int target_height = g_remote_height;
+    int target_width = 0;
+    int target_height = 0;
 
     {
         std::lock_guard<std::mutex> lock(g_screen_mutex);
-        if (g_screen_width > 0 && g_screen_height > 0) {
-            target_width = g_screen_width;
-            target_height = g_screen_height;
-        }
+        target_width = g_screen_width;
+        target_height = g_screen_height;
     }
 
-    remote_x = xPos * target_width / client_width;
-    remote_y = yPos * target_height / client_height;
+    int display_x = 0;
+    int display_y = 0;
+    int display_width = 0;
+    int display_height = 0;
+    if (!calculateDisplayRect(
+            target_width,
+            target_height,
+            client_width,
+            client_height,
+            display_x,
+            display_y,
+            display_width,
+            display_height
+        )) {
+        return false;
+    }
+
+    g_window_width = client_width;
+    g_window_height = client_height;
+    g_display_x = display_x;
+    g_display_y = display_y;
+    g_display_width = display_width;
+    g_display_height = display_height;
+
+    if (xPos < display_x || yPos < display_y
+        || xPos >= display_x + display_width
+        || yPos >= display_y + display_height) {
+        return false;
+    }
+
+    remote_x = static_cast<int>(
+        1LL * (xPos - display_x) * target_width / display_width
+    );
+    remote_y = static_cast<int>(
+        1LL * (yPos - display_y) * target_height / display_height
+    );
+
+    remote_x = std::max(0, std::min(target_width - 1, remote_x));
+    remote_y = std::max(0, std::min(target_height - 1, remote_y));
 
     return true;
 }
@@ -1174,6 +1504,8 @@ void handleIncomingPacket(const Packet& pkt)
 
 void handleScreenBegin(const Packet& pkt)
 {
+    DiscardReceivingFrame();
+
     if (pkt.body_len != sizeof(ScreenFrameInfo)) {
         std::cout << "invalid screen begin len=" << pkt.body_len << std::endl;
         return;
@@ -1187,18 +1519,21 @@ void handleScreenBegin(const Packet& pkt)
         return;
     }
 
-    if (info.format != SCREEN_FORMAT_BGRA32) {
+    if (info.format != SCREEN_FORMAT_BGRA32
+        && info.format != SCREEN_FORMAT_JPEG) {
         std::cout << "unsupported screen format=" << info.format << std::endl;
         return;
     }
 
-    if (info.total_size != info.width * info.height * 4) {
-        std::cout << "invalid screen total size" << std::endl;
+    long long raw_size = 1LL * info.width * info.height * 4;
+    if (raw_size <= 0 || raw_size > MAX_PROTOCOL_FRAME_SIZE) {
+        std::cout << "screen frame too large" << std::endl;
         return;
     }
 
-    if (info.total_size > 100 * 1024 * 1024) {
-        std::cout << "screen frame too large" << std::endl;
+    if (info.format == SCREEN_FORMAT_BGRA32
+        && raw_size != info.total_size) {
+        std::cout << "invalid BGRA32 total size" << std::endl;
         return;
     }
 
@@ -1214,11 +1549,6 @@ void handleScreenBegin(const Packet& pkt)
     g_frame_buffer.clear();
     g_frame_buffer.resize(g_frame_total_size);
 
-    std::cout << "recv screen begin frame_id=" << g_frame_id
-        << " total_size=" << g_frame_total_size
-        << " resolution=" << g_frame_width
-        << "x" << g_frame_height
-        << std::endl;
 }
 
 void handleScreenChunk(const Packet& pkt)
@@ -1231,6 +1561,7 @@ void handleScreenChunk(const Packet& pkt)
 
     if (pkt.body_len < header_size) {
         std::cout << "invalid screen chunk len=" << pkt.body_len << std::endl;
+        DiscardReceivingFrame();
         return;
     }
 
@@ -1238,22 +1569,25 @@ void handleScreenChunk(const Packet& pkt)
     memcpy(&header, pkt.data, header_size);
 
     if (header.frame_id != g_frame_id) {
+        DiscardReceivingFrame();
         return;
     }
 
     if (header.data_len <= 0) {
+        DiscardReceivingFrame();
         return;
     }
 
-    if (header.offset < 0
-        || header.offset > g_frame_total_size
+    if (header.offset != g_frame_received_size
         || header.data_len > g_frame_total_size - header.offset) {
         std::cout << "invalid screen chunk offset" << std::endl;
+        DiscardReceivingFrame();
         return;
     }
 
-    if (header_size + header.data_len > pkt.body_len) {
+    if (header_size + header.data_len != pkt.body_len) {
         std::cout << "invalid screen chunk payload" << std::endl;
+        DiscardReceivingFrame();
         return;
     }
 
@@ -1266,70 +1600,55 @@ void handleScreenChunk(const Packet& pkt)
     g_frame_received_size += header.data_len;
     g_frame_chunk_count++;
 
-    if (g_frame_chunk_count % 10 == 0
-        || header.offset + header.data_len == g_frame_total_size) {
-        std::cout << "recv screen chunk frame_id=" << header.frame_id
-            << " chunk=" << g_frame_chunk_count
-            << " offset=" << header.offset
-            << " len=" << header.data_len
-            << " received_size=" << g_frame_received_size
-            << "/" << g_frame_total_size
-            << std::endl;
-    }
 }
 
 void handleScreenEnd(const Packet& pkt)
 {
-    if (pkt.body_len != sizeof(int)) {
+    if (pkt.body_len != sizeof(int32_t)) {
         std::cout << "invalid screen end len=" << pkt.body_len << std::endl;
+        DiscardReceivingFrame();
         return;
     }
 
-    int end_frame_id = -1;
-    memcpy(&end_frame_id, pkt.data, sizeof(int));
-
-    std::cout << "recv screen end frame_id=" << end_frame_id
-        << " received_size=" << g_frame_received_size
-        << " total_size=" << g_frame_total_size
-        << " chunks=" << g_frame_chunk_count
-        << std::endl;
+    int32_t end_frame_id = -1;
+    memcpy(&end_frame_id, pkt.data, sizeof(end_frame_id));
 
     if (!g_receiving_frame || end_frame_id != g_frame_id) {
-        std::cout << "screen end frame mismatch current_frame_id="
-            << g_frame_id
-            << " receiving=" << g_receiving_frame
-            << std::endl;
+        DiscardReceivingFrame();
         return;
     }
 
-    if (g_frame_received_size < g_frame_total_size) {
+    if (g_frame_received_size != g_frame_total_size) {
         std::cout << "screen frame incomplete received="
             << g_frame_received_size
             << " total=" << g_frame_total_size
             << std::endl;
-        g_receiving_frame = false;
+        DiscardReceivingFrame();
         return;
     }
 
+    QueuedScreenFrame completed;
+    completed.frame_id = g_frame_id;
+    completed.width = g_frame_width;
+    completed.height = g_frame_height;
+    completed.receive_size = g_frame_total_size;
+    completed.format = g_frame_format;
+    completed.data = std::move(g_frame_buffer);
+
     {
-        std::lock_guard<std::mutex> lock(g_screen_mutex);
-        g_screen_bgra = g_frame_buffer;
-        g_screen_width = g_frame_width;
-        g_screen_height = g_frame_height;
+        std::lock_guard<std::mutex> lock(g_screen_decode_mutex);
+        completed.generation = g_screen_generation;
+        g_pending_screen_frame = std::move(completed);
+        g_pending_screen_frame_ready = true;
     }
+    g_screen_decode_condition.notify_one();
 
-    g_receiving_frame = false;
-
-    if (g_hwnd != NULL) {
-        InvalidateRect(g_hwnd, NULL, FALSE);
-    }
-
-    std::cout << "screen frame ready frame=" << end_frame_id << std::endl;
+    DiscardReceivingFrame();
 }
 
 void drawRemoteScreen(HDC hdc, RECT client_rect)
 {
-    std::vector<unsigned char> local_screen;
+    std::shared_ptr<const std::vector<unsigned char>> local_screen;
     int width = 0;
     int height = 0;
 
@@ -1343,16 +1662,31 @@ void drawRemoteScreen(HDC hdc, RECT client_rect)
     int client_width = client_rect.right - client_rect.left;
     int client_height = client_rect.bottom - client_rect.top;
 
-    if (local_screen.empty() || width <= 0 || height <= 0) {
-        const char* text1 = "Windows -> Linux Remote Control";
-        const char* text2 = "Waiting for Linux screen frames...";
-        const char* text3 = "Mouse and keyboard events can still be sent.";
+    HBRUSH black_brush = static_cast<HBRUSH>(
+        GetStockObject(BLACK_BRUSH)
+    );
+    FillRect(hdc, &client_rect, black_brush);
 
-        TextOutA(hdc, 20, 20, text1, (int)strlen(text1));
-        TextOutA(hdc, 20, 50, text2, (int)strlen(text2));
-        TextOutA(hdc, 20, 80, text3, (int)strlen(text3));
+    if (!local_screen || local_screen->empty()
+        || width <= 0 || height <= 0
+        || client_width <= 0 || client_height <= 0) {
         return;
     }
+
+    if (!calculateDisplayRect(
+            width,
+            height,
+            client_width,
+            client_height,
+            g_display_x,
+            g_display_y,
+            g_display_width,
+            g_display_height
+        )) {
+        return;
+    }
+    g_window_width = client_width;
+    g_window_height = client_height;
 
     BITMAPINFO bmi;
     memset(&bmi, 0, sizeof(bmi));
@@ -1364,17 +1698,19 @@ void drawRemoteScreen(HDC hdc, RECT client_rect)
     bmi.bmiHeader.biBitCount = 32;
     bmi.bmiHeader.biCompression = BI_RGB;
 
+    SetStretchBltMode(hdc, HALFTONE);
+    SetBrushOrgEx(hdc, g_display_x, g_display_y, NULL);
     StretchDIBits(
         hdc,
-        0,
-        0,
-        client_width,
-        client_height,
+        g_display_x,
+        g_display_y,
+        g_display_width,
+        g_display_height,
         0,
         0,
         width,
         height,
-        local_screen.data(),
+        local_screen->data(),
         &bmi,
         DIB_RGB_COLORS,
         SRCCOPY

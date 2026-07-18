@@ -18,12 +18,21 @@
 #include <string>
 #include <climits>
 
+#if defined(__GNUC__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wmissing-field-initializers"
+#endif
 #define STB_IMAGE_WRITE_IMPLEMENTATION
 #include "../third_party/stb_image_write.h"
+#if defined(__GNUC__)
+#pragma GCC diagnostic pop
+#endif
 
+#if defined(_MSC_VER)
 #pragma comment(lib, "ws2_32.lib")
 #pragma comment(lib, "gdi32.lib")
 #pragma comment(lib, "user32.lib")
+#endif
 
 #include "../common/packet.h"
 
@@ -836,7 +845,12 @@ bool sendRealScreenFrame(
         chunk_count++;
     }
 
-    Packet end_pkt = buildRawPacket(CMD_SCREEN_END, (const char*)&frame_id, sizeof(frame_id));
+    int32_t end_frame_id = frame_id;
+    Packet end_pkt = buildRawPacket(
+        CMD_SCREEN_END,
+        reinterpret_cast<const char*>(&end_frame_id),
+        sizeof(end_frame_id)
+    );
     if (!sendPacket(client_socket, end_pkt)) {
         std::cout << "send screen end failed" << std::endl;
         return false;

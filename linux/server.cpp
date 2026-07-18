@@ -20,6 +20,17 @@
 #include <X11/extensions/XShm.h>
 #include <sys/ipc.h>
 #include <sys/shm.h>
+#include <climits>
+
+#if defined(__GNUC__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wmissing-field-initializers"
+#endif
+#define STB_IMAGE_WRITE_IMPLEMENTATION
+#include "../third_party/stb_image_write.h"
+#if defined(__GNUC__)
+#pragma GCC diagnostic pop
+#endif
 
 #include "../common/packet.h"
 
@@ -35,6 +46,72 @@ void handleKeyEvent(const char *data, int len);
 
 bool sendAll(int sock, const char *buf, int len);
 bool sendPacket(int sock, const Packet &pkt);
+void writeJpegToVector(void* context, void* data, int size);
+unsigned long readXImagePixel(const XImage* image, int x, int y);
+unsigned char extractColorChannel(unsigned long pixel, unsigned long mask);
+
+void writeJpegToVector(void* context, void* data, int size)
+{
+    if (context == nullptr || data == nullptr || size <= 0)
+    {
+        return;
+    }
+
+    std::vector<unsigned char>* output =
+        static_cast<std::vector<unsigned char>*>(context);
+    const unsigned char* bytes =
+        static_cast<const unsigned char*>(data);
+    output->insert(output->end(), bytes, bytes + size);
+}
+
+unsigned long readXImagePixel(const XImage* image, int x, int y)
+{
+    int bytes_per_pixel = (image->bits_per_pixel + 7) / 8;
+    const unsigned char* pixel_bytes =
+        reinterpret_cast<const unsigned char*>(image->data)
+        + y * image->bytes_per_line
+        + x * bytes_per_pixel;
+
+    unsigned long pixel = 0;
+    if (image->byte_order == LSBFirst)
+    {
+        for (int byte = 0; byte < bytes_per_pixel; ++byte)
+        {
+            pixel |= static_cast<unsigned long>(pixel_bytes[byte])
+                << (byte * 8);
+        }
+    }
+    else
+    {
+        for (int byte = 0; byte < bytes_per_pixel; ++byte)
+        {
+            pixel = (pixel << 8) | pixel_bytes[byte];
+        }
+    }
+    return pixel;
+}
+
+unsigned char extractColorChannel(unsigned long pixel, unsigned long mask)
+{
+    if (mask == 0)
+    {
+        return 0;
+    }
+
+    int shift = 0;
+    while (((mask >> shift) & 1UL) == 0)
+    {
+        ++shift;
+    }
+
+    unsigned long maximum = mask >> shift;
+    unsigned long value = (pixel & mask) >> shift;
+    return static_cast<unsigned char>(
+        (static_cast<unsigned long long>(value) * 255ULL
+            + maximum / 2)
+        / maximum
+    );
+}
 
 bool sendRealScreenFrame(
     int client_fd,
@@ -55,6 +132,8 @@ const int SERVER_PORT = 9999;
 const int MIN_FRAME_INTERVAL_MS = 50;
 const int UNCHANGED_FRAME_INTERVAL_MS = 100;
 const int MAX_FRAME_INTERVAL_MS = 1000;
+const int JPEG_QUALITY = 75;
+const long long MAX_PROTOCOL_FRAME_SIZE = INT_MAX;
 
 int main()
 {
@@ -614,10 +693,10 @@ bool sendPacket(int sock, const Packet &pkt)
 // 捕获 Linux 当前屏幕，并通过自定义协议发送给 Windows 客户端
 //
 // 当前版本：
-// 1. 使用 X11 的 XGetImage 抓取整张桌面截图
-// 2. 将 XImage 像素转换为 Windows 端可显示的 BGRA32 格式
-// 3. 使用 SCREEN_BEGIN / SCREEN_CHUNK / SCREEN_END 分包发送
-// 4. 未变化帧跳过发送，变化帧仍使用原始 BGRA32 完整传输
+// 1. 使用 XShm 获取整张原始桌面截图
+// 2. 根据 XImage 字节序与 RGB mask 转换为连续 RGB
+// 3. 在内存中编码 quality=75 的 JPEG
+// 4. 使用 SCREEN_BEGIN / SCREEN_CHUNK / SCREEN_END 分包发送
 // ================================
 bool sendRealScreenFrame(
     int client_fd,
@@ -759,55 +838,77 @@ bool sendRealScreenFrame(
 
     auto t1 = std::chrono::steady_clock::now();
 
-    // ================================
-    // 2. 创建 BGRA32 缓冲区
-    // Windows 端显示时使用 BGRA32，每个像素 4 字节
-    // ================================
-    int total_size = width * height * 4;
-    std::vector<unsigned char> frame(total_size);
-
-    // ================================
-    // 3. 将 XImage 数据转换为 BGRA32
-    // 当前环境 bits_per_pixel 应该是 32
-    // 小端机器下一般是 B G R X 顺序
-    // ================================
-    if (image->bits_per_pixel == 32)
+    long long pixel_count = 1LL * width * height;
+    long long rgb_size64 = pixel_count * 3;
+    if (pixel_count <= 0 || rgb_size64 > MAX_PROTOCOL_FRAME_SIZE)
     {
-        unsigned char* src = reinterpret_cast<unsigned char*>(image->data);
-
-        for (int y = 0; y < height; y++)
-        {
-            unsigned char* src_row = src + y * image->bytes_per_line;
-
-            for (int x = 0; x < width; x++)
-            {
-                unsigned char* src_pixel = src_row + x * 4;
-
-                int index = (y * width + x) * 4;
-
-                frame[index + 0] = src_pixel[0];
-                frame[index + 1] = src_pixel[1];
-                frame[index + 2] = src_pixel[2];
-                frame[index + 3] = 255;
-            }
-        }
-    }
-    else
-    {
-        std::cout << "unsupported bits_per_pixel="
-                  << image->bits_per_pixel << std::endl;
+        std::cout << "screen frame too large" << std::endl;
         return false;
+    }
+
+    int rgb_size = static_cast<int>(rgb_size64);
+    std::vector<unsigned char> rgb(rgb_size);
+
+    // Respect XImage storage and channel masks rather than assuming BGRX.
+    int bytes_per_pixel = (image->bits_per_pixel + 7) / 8;
+    if (bytes_per_pixel <= 0
+        || bytes_per_pixel > static_cast<int>(sizeof(unsigned long))
+        || image->red_mask == 0
+        || image->green_mask == 0
+        || image->blue_mask == 0)
+    {
+        std::cout << "unsupported XImage pixel format"
+                  << " bits_per_pixel=" << image->bits_per_pixel
+                  << " byte_order=" << image->byte_order
+                  << " red_mask=" << image->red_mask
+                  << " green_mask=" << image->green_mask
+                  << " blue_mask=" << image->blue_mask
+                  << std::endl;
+        return false;
+    }
+
+    for (int y = 0; y < height; ++y)
+    {
+        for (int x = 0; x < width; ++x)
+        {
+            unsigned long pixel = readXImagePixel(image, x, y);
+            int index = (y * width + x) * 3;
+            rgb[index + 0] = extractColorChannel(pixel, image->red_mask);
+            rgb[index + 1] = extractColorChannel(pixel, image->green_mask);
+            rgb[index + 2] = extractColorChannel(pixel, image->blue_mask);
+        }
     }
 
     auto t2 = std::chrono::steady_clock::now();
 
     if (previous_width == width
         && previous_height == height
-        && previous_frame.size() == frame.size()
-        && memcmp(previous_frame.data(), frame.data(), frame.size()) == 0)
+        && previous_frame.size() == rgb.size()
+        && memcmp(previous_frame.data(), rgb.data(), rgb.size()) == 0)
     {
         return true;
     }
+
+    std::vector<unsigned char> jpeg;
+    jpeg.reserve(static_cast<size_t>(std::max(1024LL, pixel_count)));
+    int encode_ok = stbi_write_jpg_to_func(
+        writeJpegToVector,
+        &jpeg,
+        width,
+        height,
+        3,
+        rgb.data(),
+        JPEG_QUALITY
+    );
+    auto t3 = std::chrono::steady_clock::now();
+
+    if (encode_ok == 0 || jpeg.empty() || jpeg.size() > INT_MAX)
+    {
+        std::cout << "JPEG memory encoding failed" << std::endl;
+        return false;
+    }
+
+    int total_size = static_cast<int>(jpeg.size());
 
     // ================================
     // 4. 构造屏幕帧头信息
@@ -816,7 +917,7 @@ bool sendRealScreenFrame(
     info.frame_id = frame_id;
     info.width = width;
     info.height = height;
-    info.format = SCREEN_FORMAT_BGRA32;
+    info.format = SCREEN_FORMAT_JPEG;
     info.total_size = total_size;
 
     Packet begin_pkt = {};
@@ -861,7 +962,7 @@ bool sendRealScreenFrame(
 
         memcpy(
             chunk_pkt.data + sizeof(ScreenChunkHeader),
-            frame.data() + offset,
+            jpeg.data() + offset,
             data_len
         );
 
@@ -882,9 +983,10 @@ bool sendRealScreenFrame(
     Packet end_pkt = {};
     end_pkt.magic = PACKET_MAGIC;
     end_pkt.cmd = CMD_SCREEN_END;
-    end_pkt.body_len = sizeof(int);
+    end_pkt.body_len = sizeof(int32_t);
 
-    memcpy(end_pkt.data, &frame_id, sizeof(frame_id));
+    int32_t end_frame_id = frame_id;
+    memcpy(end_pkt.data, &end_frame_id, sizeof(end_frame_id));
 
     if (!sendPacket(client_fd, end_pkt))
     {
@@ -892,13 +994,11 @@ bool sendRealScreenFrame(
         return false;
     }
 
-    auto t3 = std::chrono::steady_clock::now();
-    send_ms = std::chrono::duration_cast<std::chrono::milliseconds>(t3 - t2).count();
+    auto t4 = std::chrono::steady_clock::now();
+    send_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        t4 - t3
+    ).count();
     frame_sent = true;
-
-    previous_frame.swap(frame);
-    previous_width = width;
-    previous_height = height;
 
     // ================================
     // 7. 每 10 帧打印一次性能统计
@@ -910,17 +1010,29 @@ bool sendRealScreenFrame(
     {
         auto capture_ms = std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count();
         auto convert_ms = std::chrono::duration_cast<std::chrono::milliseconds>(t2 - t1).count();
-        auto measured_send_ms = std::chrono::duration_cast<std::chrono::milliseconds>(t3 - t2).count();
-        auto total_ms = std::chrono::duration_cast<std::chrono::milliseconds>(t3 - t0).count();
+        auto encode_ms = std::chrono::duration_cast<std::chrono::milliseconds>(t3 - t2).count();
+        auto measured_send_ms = std::chrono::duration_cast<std::chrono::milliseconds>(t4 - t3).count();
+        long long raw_size = 1LL * image->bytes_per_line * image->height;
+        double compression_ratio = jpeg.empty()
+            ? 0.0
+            : static_cast<double>(raw_size)
+                / static_cast<double>(jpeg.size());
 
-        std::cout << "[frame " << frame_id << "] "
-                  << "capture=" << capture_ms << "ms, "
-                  << "convert=" << convert_ms << "ms, "
-                  << "send=" << measured_send_ms << "ms, "
-                  << "total=" << total_ms << "ms, "
-                  << "chunks=" << chunk_count
+        std::cout << "[screen] frame_id=" << frame_id
+                  << " capture_ms=" << capture_ms
+                  << " color_convert_ms=" << convert_ms
+                  << " jpeg_encode_ms=" << encode_ms
+                  << " send_ms=" << measured_send_ms
+                  << " raw_size=" << raw_size
+                  << " jpeg_size=" << jpeg.size()
+                  << " compression_ratio=" << compression_ratio
+                  << " chunk_count=" << chunk_count
                   << std::endl;
     }
+
+    previous_frame.swap(rgb);
+    previous_width = width;
+    previous_height = height;
 
     return true;
 }

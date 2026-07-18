@@ -20,6 +20,8 @@
 #include <mutex>
 #include <atomic>
 #include <condition_variable>
+#include <memory>
+#include <cstdint>
 
 #include <X11/Xlib.h>
 #include <X11/Xutil.h>
@@ -44,10 +46,27 @@ int g_receive_frame_received_size = 0;
 int g_receive_frame_format = SCREEN_FORMAT_BGRA32;
 bool g_receiving_frame = false;
 
-std::vector<unsigned char> g_frame_buffer;
+std::shared_ptr<const std::vector<unsigned char>> g_frame_buffer;
 int g_frame_id = -1;
 int g_frame_width = 0;
 int g_frame_height = 0;
+int g_frame_generation = 0;
+int g_frame_receive_size = 0;
+long long g_frame_jpeg_decode_ms = 0;
+std::vector<unsigned char> g_scaled_frame_buffer;
+int g_scaled_window_width = 0;
+int g_scaled_window_height = 0;
+int g_scaled_bytes_per_line = 0;
+int g_display_x = 0;
+int g_display_y = 0;
+int g_display_width = 0;
+int g_display_height = 0;
+int g_ximage_bits_per_pixel = 0;
+int g_ximage_bitmap_pad = 32;
+int g_ximage_byte_order = LSBFirst;
+unsigned long g_ximage_red_mask = 0;
+unsigned long g_ximage_green_mask = 0;
+unsigned long g_ximage_blue_mask = 0;
 
 struct QueuedScreenFrame
 {
@@ -77,9 +96,53 @@ std::thread g_screen_decode_thread;
 bool g_screen_decode_running = false;
 bool g_pending_screen_frame_ready = false;
 bool g_decoded_screen_frame_ready = false;
-int g_screen_generation = 0;
+std::atomic<int> g_screen_generation(0);
 QueuedScreenFrame g_pending_screen_frame;
 DecodedScreenFrame g_decoded_screen_frame;
+
+struct ScaleRequest
+{
+    int frame_id = -1;
+    int width = 0;
+    int height = 0;
+    int window_width = 0;
+    int window_height = 0;
+    int receive_size = 0;
+    long long jpeg_decode_ms = 0;
+    int generation = 0;
+    uint64_t serial = 0;
+    std::shared_ptr<const std::vector<unsigned char>> bgra;
+};
+
+struct ScaledScreenFrame
+{
+    int frame_id = -1;
+    int remote_width = 0;
+    int remote_height = 0;
+    int window_width = 0;
+    int window_height = 0;
+    int display_x = 0;
+    int display_y = 0;
+    int display_width = 0;
+    int display_height = 0;
+    int bytes_per_line = 0;
+    int receive_size = 0;
+    long long jpeg_decode_ms = 0;
+    long long scale_ms = 0;
+    int generation = 0;
+    uint64_t serial = 0;
+    std::vector<unsigned char> bgra;
+};
+
+std::mutex g_scale_mutex;
+std::condition_variable g_scale_condition;
+std::thread g_scale_thread;
+bool g_scale_running = false;
+bool g_scale_request_ready = false;
+bool g_scaled_screen_frame_ready = false;
+uint64_t g_scale_serial = 0;
+ScaleRequest g_scale_request;
+ScaledScreenFrame g_scaled_screen_frame;
 
 // ================================
 // 全局变量：X11 显示窗口状态
@@ -168,8 +231,32 @@ bool initDisplayWindow(int width, int height);
 void drawConnectionInterface();
 void drawFrameToWindow();
 void displayLatestDecodedFrame();
+void displayLatestScaledFrame();
 void screenDecodeLoop();
 void stopScreenDecodeThread();
+void screenScaleLoop();
+void stopScreenScaleThread();
+void startScreenProcessingThreads();
+void queueScaleRequest();
+bool calculateDisplayRect(
+    int remote_width,
+    int remote_height,
+    int window_width,
+    int window_height,
+    int& display_x,
+    int& display_y,
+    int& display_width,
+    int& display_height
+);
+unsigned long scaleChannelToMask(
+    unsigned char channel,
+    unsigned long mask
+);
+void writeXImagePixel(
+    unsigned char* destination,
+    int bytes_per_pixel,
+    unsigned long pixel
+);
 void discardReceivingFrame();
 void resetRemoteState();
 void closeDisplayWindow();
@@ -195,9 +282,6 @@ int main(int argc, char* argv[])
     {
         return 1;
     }
-
-    g_screen_decode_running = true;
-    g_screen_decode_thread = std::thread(screenDecodeLoop);
 
     int sock = -1;
 
@@ -229,9 +313,15 @@ int main(int argc, char* argv[])
             break;
         }
 
+        resetRemoteState();
+        startScreenProcessingThreads();
+
         Packet hello = buildPacket(CMD_HELLO, "hello from linux client");
         if (!sendPacket(sock, hello))
         {
+            stopScreenDecodeThread();
+            stopScreenScaleThread();
+            resetRemoteState();
             g_connection_status = "connect failed: hello send failed";
             g_client_state = ClientState::FAILED;
             close(sock);
@@ -240,7 +330,10 @@ int main(int argc, char* argv[])
             continue;
         }
 
+        drawFrameToWindow();
         recvLoop(sock);
+        stopScreenDecodeThread();
+        stopScreenScaleThread();
         close(sock);
         sock = -1;
 
@@ -250,6 +343,12 @@ int main(int argc, char* argv[])
             g_client_state = ClientState::WAITING;
             g_connection_status = "waiting - disconnected";
             XStoreName(g_display, g_window, "Linux Remote Control Client");
+            int screen = DefaultScreen(g_display);
+            XSetWindowBackground(
+                g_display,
+                g_window,
+                WhitePixel(g_display, screen)
+            );
             XSizeHints size_hints = {};
             size_hints.flags = 0;
             XSetWMNormalHints(g_display, g_window, &size_hints);
@@ -273,6 +372,7 @@ int main(int argc, char* argv[])
 
     cancelConnectThread();
     stopScreenDecodeThread();
+    stopScreenScaleThread();
     closeDisplayWindow();
     return 0;
 }
@@ -814,28 +914,40 @@ bool convertLocalToRemote(int local_x, int local_y, int& remote_x, int& remote_y
         return false;
     }
 
-    remote_x = local_x * g_frame_width / g_window_width;
-    remote_y = local_y * g_frame_height / g_window_height;
-
-    if (remote_x < 0)
+    int display_x = 0;
+    int display_y = 0;
+    int display_width = 0;
+    int display_height = 0;
+    if (!calculateDisplayRect(
+            g_frame_width,
+            g_frame_height,
+            g_window_width,
+            g_window_height,
+            display_x,
+            display_y,
+            display_width,
+            display_height
+        ))
     {
-        remote_x = 0;
+        return false;
     }
 
-    if (remote_y < 0)
+    if (local_x < display_x || local_y < display_y
+        || local_x >= display_x + display_width
+        || local_y >= display_y + display_height)
     {
-        remote_y = 0;
+        return false;
     }
 
-    if (remote_x >= g_frame_width)
-    {
-        remote_x = g_frame_width - 1;
-    }
+    remote_x = static_cast<int>(
+        1LL * (local_x - display_x) * g_frame_width / display_width
+    );
+    remote_y = static_cast<int>(
+        1LL * (local_y - display_y) * g_frame_height / display_height
+    );
 
-    if (remote_y >= g_frame_height)
-    {
-        remote_y = g_frame_height - 1;
-    }
+    remote_x = std::max(0, std::min(g_frame_width - 1, remote_x));
+    remote_y = std::max(0, std::min(g_frame_height - 1, remote_y));
 
     return true;
 }
@@ -856,6 +968,7 @@ void handleX11Events(int sock)
     if (g_client_state == ClientState::CONNECTED)
     {
         displayLatestDecodedFrame();
+        displayLatestScaledFrame();
     }
 
     while (XPending(g_display) > 0)
@@ -888,6 +1001,7 @@ void handleX11Events(int sock)
         {
             g_window_width = event.xconfigure.width;
             g_window_height = event.xconfigure.height;
+            queueScaleRequest();
             drawFrameToWindow();
         }
         else if (event.type == MotionNotify)
@@ -907,7 +1021,7 @@ void handleX11Events(int sock)
 
             if (!convertLocalToRemote(local_x, local_y, remote_x, remote_y))
             {
-                return;
+                continue;
             }
 
             sendMouseEvent(sock, MOUSE_ACTION_CLICK, button, remote_x, remote_y);
@@ -1078,6 +1192,360 @@ void discardReceivingFrame()
     g_receiving_frame = false;
 }
 
+bool calculateDisplayRect(
+    int remote_width,
+    int remote_height,
+    int window_width,
+    int window_height,
+    int& display_x,
+    int& display_y,
+    int& display_width,
+    int& display_height
+)
+{
+    if (remote_width <= 0 || remote_height <= 0
+        || window_width <= 0 || window_height <= 0)
+    {
+        return false;
+    }
+
+    if (1LL * window_width * remote_height
+        <= 1LL * window_height * remote_width)
+    {
+        display_width = window_width;
+        display_height = std::max(
+            1,
+            static_cast<int>(
+                1LL * window_width * remote_height / remote_width
+            )
+        );
+    }
+    else
+    {
+        display_height = window_height;
+        display_width = std::max(
+            1,
+            static_cast<int>(
+                1LL * window_height * remote_width / remote_height
+            )
+        );
+    }
+
+    display_x = (window_width - display_width) / 2;
+    display_y = (window_height - display_height) / 2;
+    return true;
+}
+
+unsigned long scaleChannelToMask(
+    unsigned char channel,
+    unsigned long mask
+)
+{
+    if (mask == 0)
+    {
+        return 0;
+    }
+
+    int shift = 0;
+    while (((mask >> shift) & 1UL) == 0)
+    {
+        ++shift;
+    }
+    unsigned long maximum = mask >> shift;
+    unsigned long value = static_cast<unsigned long>(
+        (static_cast<unsigned long long>(channel) * maximum + 127ULL)
+        / 255ULL
+    );
+    return (value << shift) & mask;
+}
+
+void writeXImagePixel(
+    unsigned char* destination,
+    int bytes_per_pixel,
+    unsigned long pixel
+)
+{
+    if (g_ximage_byte_order == LSBFirst)
+    {
+        for (int byte = 0; byte < bytes_per_pixel; ++byte)
+        {
+            destination[byte] = static_cast<unsigned char>(
+                (pixel >> (byte * 8)) & 0xffUL
+            );
+        }
+    }
+    else
+    {
+        for (int byte = 0; byte < bytes_per_pixel; ++byte)
+        {
+            int shift = (bytes_per_pixel - byte - 1) * 8;
+            destination[byte] = static_cast<unsigned char>(
+                (pixel >> shift) & 0xffUL
+            );
+        }
+    }
+}
+
+void queueScaleRequest()
+{
+    if (!g_frame_buffer || g_frame_buffer->empty()
+        || g_frame_width <= 0 || g_frame_height <= 0
+        || g_window_width <= 0 || g_window_height <= 0)
+    {
+        return;
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(g_scale_mutex);
+        ScaleRequest request;
+        request.frame_id = g_frame_id;
+        request.width = g_frame_width;
+        request.height = g_frame_height;
+        request.window_width = g_window_width;
+        request.window_height = g_window_height;
+        request.receive_size = g_frame_receive_size;
+        request.jpeg_decode_ms = g_frame_jpeg_decode_ms;
+        request.generation = g_frame_generation;
+        request.serial = ++g_scale_serial;
+        request.bgra = g_frame_buffer;
+        g_scale_request = std::move(request);
+        g_scale_request_ready = true;
+    }
+    g_scale_condition.notify_one();
+}
+
+void startScreenProcessingThreads()
+{
+    {
+        std::lock_guard<std::mutex> lock(g_screen_frame_mutex);
+        g_screen_decode_running = true;
+        g_pending_screen_frame_ready = false;
+    }
+    if (!g_screen_decode_thread.joinable())
+    {
+        g_screen_decode_thread = std::thread(screenDecodeLoop);
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(g_scale_mutex);
+        g_scale_running = true;
+        g_scale_request_ready = false;
+    }
+    if (!g_scale_thread.joinable())
+    {
+        g_scale_thread = std::thread(screenScaleLoop);
+    }
+}
+
+void screenScaleLoop()
+{
+    while (true)
+    {
+        ScaleRequest request;
+        {
+            std::unique_lock<std::mutex> lock(g_scale_mutex);
+            g_scale_condition.wait(
+                lock,
+                []()
+                {
+                    return !g_scale_running || g_scale_request_ready;
+                }
+            );
+
+            if (!g_scale_running && !g_scale_request_ready)
+            {
+                return;
+            }
+
+            request = std::move(g_scale_request);
+            g_scale_request_ready = false;
+        }
+
+        ScaledScreenFrame scaled;
+        scaled.frame_id = request.frame_id;
+        scaled.remote_width = request.width;
+        scaled.remote_height = request.height;
+        scaled.window_width = request.window_width;
+        scaled.window_height = request.window_height;
+        scaled.receive_size = request.receive_size;
+        scaled.jpeg_decode_ms = request.jpeg_decode_ms;
+        scaled.generation = request.generation;
+        scaled.serial = request.serial;
+
+        if (!calculateDisplayRect(
+                request.width,
+                request.height,
+                request.window_width,
+                request.window_height,
+                scaled.display_x,
+                scaled.display_y,
+                scaled.display_width,
+                scaled.display_height
+            ))
+        {
+            continue;
+        }
+
+        auto scale_start = std::chrono::steady_clock::now();
+        int bytes_per_pixel = (g_ximage_bits_per_pixel + 7) / 8;
+        int pad_bytes = g_ximage_bitmap_pad / 8;
+        if (bytes_per_pixel <= 0
+            || bytes_per_pixel > static_cast<int>(sizeof(unsigned long))
+            || pad_bytes <= 0
+            || g_ximage_red_mask == 0
+            || g_ximage_green_mask == 0
+            || g_ximage_blue_mask == 0)
+        {
+            continue;
+        }
+
+        long long row_bits =
+            1LL * scaled.display_width * g_ximage_bits_per_pixel;
+        scaled.bytes_per_line = static_cast<int>(
+            ((row_bits + g_ximage_bitmap_pad - 1)
+                / g_ximage_bitmap_pad)
+            * pad_bytes
+        );
+        long long scaled_size =
+            1LL * scaled.bytes_per_line * scaled.display_height;
+        if (scaled_size <= 0 || scaled_size > MAX_PROTOCOL_FRAME_SIZE)
+        {
+            continue;
+        }
+        scaled.bgra.resize(static_cast<size_t>(scaled_size));
+
+        const std::vector<unsigned char>& source = *request.bgra;
+        if (static_cast<long long>(source.size())
+            != 1LL * request.width * request.height * 4)
+        {
+            continue;
+        }
+        for (int y = 0; y < scaled.display_height; ++y)
+        {
+            uint64_t source_y_fixed =
+                scaled.display_height <= 1
+                    ? 0
+                    : static_cast<uint64_t>(y)
+                        * static_cast<uint64_t>(request.height - 1)
+                        * 65536ULL
+                        / static_cast<uint64_t>(
+                            scaled.display_height - 1
+                        );
+            int y0 = static_cast<int>(source_y_fixed >> 16);
+            int y1 = std::min(request.height - 1, y0 + 1);
+            uint32_t fy = static_cast<uint32_t>(
+                source_y_fixed & 0xffffU
+            );
+            uint32_t inverse_y = 65536U - fy;
+
+            for (int x = 0; x < scaled.display_width; ++x)
+            {
+                uint64_t source_x_fixed =
+                    scaled.display_width <= 1
+                        ? 0
+                        : static_cast<uint64_t>(x)
+                            * static_cast<uint64_t>(request.width - 1)
+                            * 65536ULL
+                            / static_cast<uint64_t>(
+                                scaled.display_width - 1
+                            );
+                int x0 = static_cast<int>(source_x_fixed >> 16);
+                int x1 = std::min(request.width - 1, x0 + 1);
+                uint32_t fx = static_cast<uint32_t>(
+                    source_x_fixed & 0xffffU
+                );
+                uint32_t inverse_x = 65536U - fx;
+
+                size_t top_left =
+                    (static_cast<size_t>(y0) * request.width + x0) * 4;
+                size_t top_right =
+                    (static_cast<size_t>(y0) * request.width + x1) * 4;
+                size_t bottom_left =
+                    (static_cast<size_t>(y1) * request.width + x0) * 4;
+                size_t bottom_right =
+                    (static_cast<size_t>(y1) * request.width + x1) * 4;
+                unsigned char channels[3] = {};
+                for (int channel = 0; channel < 3; ++channel)
+                {
+                    uint64_t top =
+                        static_cast<uint64_t>(source[top_left + channel])
+                            * inverse_x
+                        + static_cast<uint64_t>(
+                            source[top_right + channel]
+                        ) * fx;
+                    uint64_t bottom =
+                        static_cast<uint64_t>(
+                            source[bottom_left + channel]
+                        ) * inverse_x
+                        + static_cast<uint64_t>(
+                            source[bottom_right + channel]
+                        ) * fx;
+                    uint64_t value =
+                        top * inverse_y + bottom * fy;
+                    channels[channel] = static_cast<unsigned char>(
+                        (value + (1ULL << 31)) >> 32
+                    );
+                }
+
+                unsigned long pixel =
+                    scaleChannelToMask(
+                        channels[2],
+                        g_ximage_red_mask
+                    )
+                    | scaleChannelToMask(
+                        channels[1],
+                        g_ximage_green_mask
+                    )
+                    | scaleChannelToMask(
+                        channels[0],
+                        g_ximage_blue_mask
+                    );
+                unsigned char* destination =
+                    scaled.bgra.data()
+                    + static_cast<size_t>(y) * scaled.bytes_per_line
+                    + static_cast<size_t>(x) * bytes_per_pixel;
+                writeXImagePixel(
+                    destination,
+                    bytes_per_pixel,
+                    pixel
+                );
+            }
+        }
+        auto scale_end = std::chrono::steady_clock::now();
+        scaled.scale_ms =
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                scale_end - scale_start
+            ).count();
+
+        {
+            std::lock_guard<std::mutex> lock(g_scale_mutex);
+            if (!g_scale_running
+                || scaled.serial != g_scale_serial
+                || scaled.generation != g_screen_generation)
+            {
+                continue;
+            }
+            g_scaled_screen_frame = std::move(scaled);
+            g_scaled_screen_frame_ready = true;
+        }
+    }
+}
+
+void stopScreenScaleThread()
+{
+    {
+        std::lock_guard<std::mutex> lock(g_scale_mutex);
+        g_scale_running = false;
+        g_scale_request_ready = false;
+    }
+    g_scale_condition.notify_all();
+
+    if (g_scale_thread.joinable())
+    {
+        g_scale_thread.join();
+    }
+}
+
 void screenDecodeLoop()
 {
     while (true)
@@ -1133,9 +1601,11 @@ void screenDecodeLoop()
 
             if (rgba == nullptr)
             {
+                const char* reason = stbi_failure_reason();
                 std::cout << "JPEG decode failed for frame_id="
                           << encoded.frame_id << ": "
-                          << stbi_failure_reason() << std::endl;
+                          << (reason == nullptr ? "unknown" : reason)
+                          << std::endl;
                 continue;
             }
 
@@ -1234,6 +1704,16 @@ void displayLatestDecodedFrame()
             return;
         }
 
+        if (g_pending_screen_frame_ready
+            && g_pending_screen_frame.generation
+                == g_decoded_screen_frame.generation
+            && g_pending_screen_frame.frame_id
+                > g_decoded_screen_frame.frame_id)
+        {
+            g_decoded_screen_frame_ready = false;
+            return;
+        }
+
         decoded = std::move(g_decoded_screen_frame);
         g_decoded_screen_frame_ready = false;
     }
@@ -1241,9 +1721,14 @@ void displayLatestDecodedFrame()
     g_frame_id = decoded.frame_id;
     g_frame_width = decoded.width;
     g_frame_height = decoded.height;
-    g_frame_buffer = std::move(decoded.bgra);
+    g_frame_generation = decoded.generation;
+    g_frame_receive_size = decoded.receive_size;
+    g_frame_jpeg_decode_ms = decoded.jpeg_decode_ms;
+    g_frame_buffer =
+        std::make_shared<const std::vector<unsigned char>>(
+            std::move(decoded.bgra)
+        );
 
-    auto display_start = std::chrono::steady_clock::now();
     if (g_configured_remote_width != g_frame_width
         || g_configured_remote_height != g_frame_height)
     {
@@ -1254,9 +1739,47 @@ void displayLatestDecodedFrame()
         }
     }
 
+    queueScaleRequest();
+}
+
+void displayLatestScaledFrame()
+{
+    ScaledScreenFrame scaled;
+    {
+        std::lock_guard<std::mutex> lock(g_scale_mutex);
+        if (!g_scaled_screen_frame_ready)
+        {
+            return;
+        }
+        if (g_scale_request_ready
+            && g_scale_request.serial > g_scaled_screen_frame.serial)
+        {
+            g_scaled_screen_frame_ready = false;
+            return;
+        }
+        scaled = std::move(g_scaled_screen_frame);
+        g_scaled_screen_frame_ready = false;
+    }
+
+    if (scaled.generation != g_screen_generation
+        || scaled.window_width != g_window_width
+        || scaled.window_height != g_window_height)
+    {
+        return;
+    }
+
+    g_scaled_frame_buffer = std::move(scaled.bgra);
+    g_scaled_window_width = scaled.window_width;
+    g_scaled_window_height = scaled.window_height;
+    g_scaled_bytes_per_line = scaled.bytes_per_line;
+    g_display_x = scaled.display_x;
+    g_display_y = scaled.display_y;
+    g_display_width = scaled.display_width;
+    g_display_height = scaled.display_height;
+
+    auto display_start = std::chrono::steady_clock::now();
     drawFrameToWindow();
     auto display_end = std::chrono::steady_clock::now();
-
     static int displayed_frame_count = 0;
     displayed_frame_count++;
     if (displayed_frame_count % 10 == 0)
@@ -1265,12 +1788,13 @@ void displayLatestDecodedFrame()
             std::chrono::duration_cast<std::chrono::milliseconds>(
                 display_end - display_start
             ).count();
-        std::cout << "[screen] frame_id=" << decoded.frame_id
-                  << " receive_size=" << decoded.receive_size
-                  << " jpeg_decode_ms=" << decoded.jpeg_decode_ms
+        std::cout << "[screen] frame_id=" << scaled.frame_id
+                  << " receive_size=" << scaled.receive_size
+                  << " jpeg_decode_ms=" << scaled.jpeg_decode_ms
+                  << " scale_ms=" << scaled.scale_ms
                   << " display_ms=" << display_ms
-                  << " width=" << decoded.width
-                  << " height=" << decoded.height
+                  << " width=" << scaled.remote_width
+                  << " height=" << scaled.remote_height
                   << std::endl;
     }
 }
@@ -1401,15 +1925,15 @@ void handleScreenChunk(const Packet& pkt)
 // ================================
 void handleScreenEnd(const Packet& pkt)
 {
-    if (pkt.body_len != sizeof(int))
+    if (pkt.body_len != sizeof(int32_t))
     {
         std::cout << "invalid screen end len=" << pkt.body_len << std::endl;
         discardReceivingFrame();
         return;
     }
 
-    int end_frame_id = -1;
-    memcpy(&end_frame_id, pkt.data, sizeof(int));
+    int32_t end_frame_id = -1;
+    memcpy(&end_frame_id, pkt.data, sizeof(end_frame_id));
 
     if (!g_receiving_frame)
     {
@@ -1620,6 +2144,36 @@ bool initConnectionWindow()
     }
 
     int screen = DefaultScreen(g_display);
+    Visual* visual = DefaultVisual(g_display, screen);
+    int depth = DefaultDepth(g_display, screen);
+    XImage* format_probe = XCreateImage(
+        g_display,
+        visual,
+        depth,
+        ZPixmap,
+        0,
+        nullptr,
+        1,
+        1,
+        32,
+        0
+    );
+    if (format_probe == nullptr)
+    {
+        std::cout << "XCreateImage format probe failed" << std::endl;
+        XCloseDisplay(g_display);
+        g_display = nullptr;
+        return false;
+    }
+    g_ximage_bits_per_pixel = format_probe->bits_per_pixel;
+    g_ximage_bitmap_pad = format_probe->bitmap_pad;
+    g_ximage_byte_order = format_probe->byte_order;
+    g_ximage_red_mask = format_probe->red_mask;
+    g_ximage_green_mask = format_probe->green_mask;
+    g_ximage_blue_mask = format_probe->blue_mask;
+    format_probe->data = nullptr;
+    XDestroyImage(format_probe);
+
     g_window = XCreateSimpleWindow(
         g_display,
         RootWindow(g_display, screen),
@@ -1698,19 +2252,53 @@ bool initDisplayWindow(int width, int height)
     }
 
     XSizeHints size_hints = {};
-    size_hints.flags = PMinSize | PMaxSize;
-    size_hints.min_width = width;
-    size_hints.max_width = width;
-    size_hints.min_height = height;
-    size_hints.max_height = height;
+    size_hints.flags = 0;
     XSetWMNormalHints(g_display, g_window, &size_hints);
 
+    int screen = DefaultScreen(g_display);
+    int available_width = std::max(
+        1,
+        DisplayWidth(g_display, screen) * 4 / 5
+    );
+    int available_height = std::max(
+        1,
+        DisplayHeight(g_display, screen) * 4 / 5
+    );
+    double initial_scale = std::min(
+        1.0,
+        std::min(
+            static_cast<double>(available_width) / width,
+            static_cast<double>(available_height) / height
+        )
+    );
+    int initial_width = std::max(
+        1,
+        static_cast<int>(width * initial_scale)
+    );
+    int initial_height = std::max(
+        1,
+        static_cast<int>(height * initial_scale)
+    );
+
     XStoreName(g_display, g_window, "Linux Client - Remote Screen");
-    XResizeWindow(g_display, g_window, width, height);
-    g_window_width = width;
-    g_window_height = height;
+    XSetWindowBackground(
+        g_display,
+        g_window,
+        BlackPixel(g_display, screen)
+    );
+    XResizeWindow(g_display, g_window, initial_width, initial_height);
+    g_window_width = initial_width;
+    g_window_height = initial_height;
     g_configured_remote_width = width;
     g_configured_remote_height = height;
+    g_scaled_frame_buffer.clear();
+    g_scaled_window_width = 0;
+    g_scaled_window_height = 0;
+    g_scaled_bytes_per_line = 0;
+    g_display_x = 0;
+    g_display_y = 0;
+    g_display_width = 0;
+    g_display_height = 0;
 
     XFlush(g_display);
     return true;
@@ -1825,22 +2413,12 @@ void drawConnectionInterface()
 // ================================
 // 函数功能：将接收到的屏幕帧绘制到 Linux client 的 X11 窗口
 // 说明：
-//   g_frame_buffer 保存解码或接收得到的 BGRA32 图像数据。
-//   始终按远程屏幕原始宽高直接绘制，不进行缩放。
+//   后台线程按当前窗口尺寸生成等比例 XImage 原生像素缓冲区。
+//   X11 线程只清理黑色背景并绘制最近准备好的显示帧。
 // ================================
 void drawFrameToWindow()
 {
     if (g_display == nullptr || g_window == 0 || g_gc == 0)
-    {
-        return;
-    }
-
-    if (g_frame_buffer.empty())
-    {
-        return;
-    }
-
-    if (g_frame_width <= 0 || g_frame_height <= 0)
     {
         return;
     }
@@ -1850,15 +2428,41 @@ void drawFrameToWindow()
         return;
     }
 
-    long long expected_size = 1LL * g_frame_width * g_frame_height * 4;
+    int screen = DefaultScreen(g_display);
+    XSetForeground(
+        g_display,
+        g_gc,
+        BlackPixel(g_display, screen)
+    );
+    XFillRectangle(
+        g_display,
+        g_window,
+        g_gc,
+        0,
+        0,
+        static_cast<unsigned int>(g_window_width),
+        static_cast<unsigned int>(g_window_height)
+    );
 
-    if ((long long)g_frame_buffer.size() != expected_size)
+    if (g_scaled_frame_buffer.empty()
+        || g_display_width <= 0 || g_display_height <= 0
+        || g_scaled_window_width != g_window_width
+        || g_scaled_window_height != g_window_height)
+    {
+        XFlush(g_display);
+        return;
+    }
+
+    long long expected_size =
+        1LL * g_scaled_bytes_per_line * g_display_height;
+    if (static_cast<long long>(g_scaled_frame_buffer.size())
+            != expected_size
+        || g_scaled_bytes_per_line <= 0)
     {
         std::cout << "frame buffer size invalid" << std::endl;
         return;
     }
 
-    int screen = DefaultScreen(g_display);
     Visual* visual = DefaultVisual(g_display, screen);
     int depth = DefaultDepth(g_display, screen);
 
@@ -1868,11 +2472,11 @@ void drawFrameToWindow()
         depth,
         ZPixmap,
         0,
-        (char*)g_frame_buffer.data(),
-        g_frame_width,
-        g_frame_height,
-        32,
-        0
+        (char*)g_scaled_frame_buffer.data(),
+        g_display_width,
+        g_display_height,
+        g_ximage_bitmap_pad,
+        g_scaled_bytes_per_line
     );
 
     if (image == nullptr)
@@ -1888,10 +2492,10 @@ void drawFrameToWindow()
         image,
         0,
         0,
-        0,
-        0,
-        g_frame_width,
-        g_frame_height
+        g_display_x,
+        g_display_y,
+        g_display_width,
+        g_display_height
     );
 
     XFlush(g_display);
@@ -1913,10 +2517,30 @@ void resetRemoteState()
         g_decoded_screen_frame_ready = false;
     }
 
-    g_frame_buffer.clear();
+    {
+        std::lock_guard<std::mutex> lock(g_scale_mutex);
+        ++g_scale_serial;
+        g_scale_request = ScaleRequest();
+        g_scaled_screen_frame = ScaledScreenFrame();
+        g_scale_request_ready = false;
+        g_scaled_screen_frame_ready = false;
+    }
+
+    g_frame_buffer.reset();
     g_frame_id = -1;
     g_frame_width = 0;
     g_frame_height = 0;
+    g_frame_generation = g_screen_generation;
+    g_frame_receive_size = 0;
+    g_frame_jpeg_decode_ms = 0;
+    g_scaled_frame_buffer.clear();
+    g_scaled_window_width = 0;
+    g_scaled_window_height = 0;
+    g_scaled_bytes_per_line = 0;
+    g_display_x = 0;
+    g_display_y = 0;
+    g_display_width = 0;
+    g_display_height = 0;
     g_configured_remote_width = 0;
     g_configured_remote_height = 0;
     g_mouse_move_pending = false;
