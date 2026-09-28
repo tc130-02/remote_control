@@ -30,6 +30,7 @@
 #endif
 
 #include "../common/heartbeat.h"
+#include "../common/reconnect.h"
 
 SOCKET g_server_socket = INVALID_SOCKET;
 SOCKET g_connect_socket = INVALID_SOCKET;
@@ -48,6 +49,7 @@ const int IDC_CONNECT_BUTTON = 1003;
 const UINT WM_APP_CONNECT_COMPLETE = WM_APP + 1;
 const UINT WM_APP_CONNECTION_LOST = WM_APP + 2;
 const UINT WM_APP_SCREEN_READY = WM_APP + 3;
+const UINT_PTR RECONNECT_TIMER_ID = 1;
 
 std::string g_default_host;
 std::string g_default_port;
@@ -69,6 +71,9 @@ std::thread g_recv_thread;
 std::thread g_connect_thread;
 std::mutex g_socket_mutex;
 std::mutex g_send_mutex;
+bool g_reconnect_pending = false;
+bool g_connect_attempt_is_reconnect = false;
+int g_reconnect_attempt = 0;
 
 std::mutex g_screen_mutex;
 std::shared_ptr<const std::vector<unsigned char>> g_screen_bgra;
@@ -117,8 +122,10 @@ std::string GetServerConfigPath();
 void LoadServerConfig(std::string& host, std::string& port);
 bool SaveServerConfig(const std::string& host, const std::string& port);
 bool ValidatePort(const std::string& port_text);
-void StartConnect();
+void StartConnect(bool is_reconnect);
 void ConnectWorker(std::string host, std::string port);
+void ScheduleReconnect(int error_code);
+void CancelReconnect(bool reset_attempt);
 void SetConnectionUiVisible(bool visible);
 void SetConnectionStatus(const std::string& status);
 void ResetRemoteScreenState();
@@ -223,7 +230,15 @@ LRESULT CALLBACK winProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
     case WM_COMMAND:
         if (LOWORD(wParam) == IDC_CONNECT_BUTTON
             && HIWORD(wParam) == BN_CLICKED) {
-            StartConnect();
+            StartConnect(false);
+        }
+        break;
+
+    case WM_TIMER:
+        if (wParam == RECONNECT_TIMER_ID) {
+            KillTimer(hwnd, RECONNECT_TIMER_ID);
+            g_reconnect_pending = false;
+            StartConnect(true);
         }
         break;
 
@@ -234,8 +249,11 @@ LRESULT CALLBACK winProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
         }
 
         g_connecting = false;
+        bool reconnect_attempt = g_connect_attempt_is_reconnect;
+        g_connect_attempt_is_reconnect = false;
 
         if (wParam != 0) {
+            CancelReconnect(true);
             g_connected = true;
             SetConnectionStatus("connected");
             SetWindowTextA(
@@ -266,11 +284,17 @@ LRESULT CALLBACK winProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
         }
         else {
             int error_code = (int)lParam;
-            SetConnectionStatus(
-                "connect failed, WSA error=" + std::to_string(error_code)
-            );
             EnableWindow(g_connect_button, TRUE);
-            SetFocus(g_host_edit);
+            if (reconnect_attempt) {
+                ScheduleReconnect(error_code);
+            }
+            else {
+                SetConnectionStatus(
+                    "connect failed, WSA error="
+                    + std::to_string(error_code)
+                );
+                SetFocus(g_host_edit);
+            }
         }
     }
     break;
@@ -289,16 +313,7 @@ LRESULT CALLBACK winProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
         SetConnectionUiVisible(true);
         EnableWindow(g_connect_button, TRUE);
 
-        int error_code = (int)wParam;
-        if (error_code != 0) {
-            SetConnectionStatus(
-                "waiting - disconnected, WSA error="
-                + std::to_string(error_code)
-            );
-        }
-        else {
-            SetConnectionStatus("waiting - disconnected");
-        }
+        ScheduleReconnect((int)wParam);
 
         InvalidateRect(hwnd, NULL, TRUE);
         SetFocus(g_host_edit);
@@ -513,6 +528,7 @@ LRESULT CALLBACK winProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
         g_app_running = false;
         g_running = false;
         g_connected = false;
+        CancelReconnect(true);
 
         {
             std::lock_guard<std::mutex> lock(g_socket_mutex);
@@ -950,16 +966,67 @@ void ScreenDecodeLoop()
     }
 }
 
-void StartConnect()
+void CancelReconnect(bool reset_attempt)
+{
+    if (g_hwnd != NULL) {
+        KillTimer(g_hwnd, RECONNECT_TIMER_ID);
+    }
+    g_reconnect_pending = false;
+
+    if (reset_attempt) {
+        g_reconnect_attempt = 0;
+    }
+}
+
+void ScheduleReconnect(int error_code)
+{
+    if (!g_app_running || g_connected || g_connecting) {
+        return;
+    }
+
+    ++g_reconnect_attempt;
+    int delay_seconds = reconnectDelaySeconds(g_reconnect_attempt);
+    g_reconnect_pending = true;
+
+    std::string status = "reconnecting in "
+        + std::to_string(delay_seconds)
+        + "s (attempt " + std::to_string(g_reconnect_attempt) + ")";
+    if (error_code != 0) {
+        status += ", WSA error=" + std::to_string(error_code);
+    }
+    SetConnectionStatus(status);
+
+    if (SetTimer(
+            g_hwnd,
+            RECONNECT_TIMER_ID,
+            delay_seconds * 1000,
+            NULL
+        ) == 0) {
+        g_reconnect_pending = false;
+        SetConnectionStatus("automatic reconnect timer failed");
+    }
+}
+
+void StartConnect(bool is_reconnect)
 {
     if (g_connecting || g_connected || !g_app_running) {
         return;
     }
 
+    if (!is_reconnect) {
+        CancelReconnect(true);
+    }
+
     char host_buffer[512] = { 0 };
     char port_buffer[32] = { 0 };
-    GetWindowTextA(g_host_edit, host_buffer, sizeof(host_buffer));
-    GetWindowTextA(g_port_edit, port_buffer, sizeof(port_buffer));
+    if (is_reconnect) {
+        strncpy(host_buffer, g_attempt_host.c_str(), sizeof(host_buffer) - 1);
+        strncpy(port_buffer, g_attempt_port.c_str(), sizeof(port_buffer) - 1);
+    }
+    else {
+        GetWindowTextA(g_host_edit, host_buffer, sizeof(host_buffer));
+        GetWindowTextA(g_port_edit, port_buffer, sizeof(port_buffer));
+    }
 
     auto trim = [](const std::string& value) {
         size_t first = value.find_first_not_of(" \t\r\n");
@@ -991,9 +1058,15 @@ void StartConnect()
 
     g_attempt_host = host;
     g_attempt_port = port;
+    g_connect_attempt_is_reconnect = is_reconnect;
     g_connecting = true;
     EnableWindow(g_connect_button, FALSE);
-    SetConnectionStatus("connecting");
+    SetConnectionStatus(
+        is_reconnect
+            ? "reconnecting (attempt "
+                + std::to_string(g_reconnect_attempt) + ")"
+            : "connecting"
+    );
 
     g_connect_thread = std::thread(ConnectWorker, host, port);
 }

@@ -31,6 +31,7 @@
 #include "../third_party/stb_image.h"
 
 #include "../common/heartbeat.h"
+#include "../common/reconnect.h"
 
 const long long MAX_PROTOCOL_FRAME_SIZE = INT_MAX;
 
@@ -165,6 +166,10 @@ std::atomic<bool> g_connecting(false);
 std::thread g_connect_thread;
 std::mutex g_connect_mutex;
 std::mutex g_send_mutex;
+bool g_reconnect_pending = false;
+bool g_connect_attempt_is_reconnect = false;
+int g_reconnect_attempt = 0;
+std::chrono::steady_clock::time_point g_next_reconnect_time;
 int g_pending_connect_socket = -1;
 int g_connect_result_socket = -1;
 bool g_connect_result_ready = false;
@@ -202,10 +207,12 @@ std::string getServerConfigPath();
 void loadServerConfig(std::string& host, std::string& port);
 bool saveServerConfig(const std::string& host, const std::string& port);
 bool validatePort(const std::string& port);
-void beginAsyncConnect();
+void beginAsyncConnect(bool is_reconnect);
 void connectWorker(std::string host, std::string port);
 bool pollConnectResult(int& connected_socket);
 void cancelConnectThread();
+void scheduleReconnect(const std::string& reason);
+void cancelReconnect(bool reset_attempt);
 
 Packet buildPacket(int cmd, const char* msg);
 Packet buildRawPacket(int cmd, const char* buffer, int len);
@@ -290,6 +297,15 @@ int main(int argc, char* argv[])
                 break;
             }
 
+            if (g_reconnect_pending
+                && !g_connecting
+                && std::chrono::steady_clock::now()
+                    >= g_next_reconnect_time)
+            {
+                g_reconnect_pending = false;
+                beginAsyncConnect(true);
+            }
+
             fd_set read_fds;
             FD_ZERO(&read_fds);
             int x11_fd = ConnectionNumber(g_display);
@@ -314,10 +330,9 @@ int main(int argc, char* argv[])
             stopScreenDecodeThread();
             stopScreenScaleThread();
             resetRemoteState();
-            g_connection_status = "connect failed: hello send failed";
-            g_client_state = ClientState::FAILED;
             close(sock);
             sock = -1;
+            scheduleReconnect("hello send failed");
             drawConnectionInterface();
             continue;
         }
@@ -332,8 +347,6 @@ int main(int argc, char* argv[])
         if (g_app_running)
         {
             resetRemoteState();
-            g_client_state = ClientState::WAITING;
-            g_connection_status = "waiting - disconnected";
             XStoreName(g_display, g_window, "Linux Remote Control Client");
             int screen = DefaultScreen(g_display);
             XSetWindowBackground(
@@ -352,6 +365,7 @@ int main(int argc, char* argv[])
             );
             g_window_width = CONNECTION_WINDOW_WIDTH;
             g_window_height = CONNECTION_WINDOW_HEIGHT;
+            scheduleReconnect("disconnected");
             drawConnectionInterface();
         }
     }
@@ -480,11 +494,47 @@ bool validatePort(const std::string& port)
         && value <= 65535;
 }
 
-void beginAsyncConnect()
+void cancelReconnect(bool reset_attempt)
+{
+    g_reconnect_pending = false;
+    if (reset_attempt)
+    {
+        g_reconnect_attempt = 0;
+    }
+}
+
+void scheduleReconnect(const std::string& reason)
+{
+    if (!g_app_running)
+    {
+        return;
+    }
+
+    ++g_reconnect_attempt;
+    int delay_seconds = reconnectDelaySeconds(g_reconnect_attempt);
+    g_next_reconnect_time = std::chrono::steady_clock::now()
+        + std::chrono::seconds(delay_seconds);
+    g_reconnect_pending = true;
+    g_client_state = ClientState::WAITING;
+    g_connection_status = "reconnecting in "
+        + std::to_string(delay_seconds)
+        + "s (attempt " + std::to_string(g_reconnect_attempt) + ")";
+    if (!reason.empty())
+    {
+        g_connection_status += ": " + reason;
+    }
+}
+
+void beginAsyncConnect(bool is_reconnect)
 {
     if (g_connecting || g_client_state == ClientState::CONNECTED)
     {
         return;
+    }
+
+    if (!is_reconnect)
+    {
+        cancelReconnect(true);
     }
 
     if (g_host_input.empty())
@@ -518,8 +568,12 @@ void beginAsyncConnect()
     }
 
     g_connecting = true;
+    g_connect_attempt_is_reconnect = is_reconnect;
     g_client_state = ClientState::CONNECTING;
-    g_connection_status = "connecting";
+    g_connection_status = is_reconnect
+        ? "reconnecting (attempt "
+            + std::to_string(g_reconnect_attempt) + ")"
+        : "connecting";
     drawConnectionInterface();
     g_connect_thread = std::thread(
         connectWorker,
@@ -659,9 +713,12 @@ bool pollConnectResult(int& connected_socket)
         g_connect_thread.join();
     }
     g_connecting = false;
+    bool reconnect_attempt = g_connect_attempt_is_reconnect;
+    g_connect_attempt_is_reconnect = false;
 
     if (result_socket >= 0)
     {
+        cancelReconnect(true);
         connected_socket = result_socket;
         g_client_state = ClientState::CONNECTED;
         g_connection_status = "connected";
@@ -669,8 +726,15 @@ bool pollConnectResult(int& connected_socket)
         return true;
     }
 
-    g_client_state = ClientState::FAILED;
-    g_connection_status = error;
+    if (reconnect_attempt)
+    {
+        scheduleReconnect(error);
+    }
+    else
+    {
+        g_client_state = ClientState::FAILED;
+        g_connection_status = error;
+    }
     drawConnectionInterface();
     return false;
 }
@@ -1057,7 +1121,7 @@ void handleConnectionEvent(const XEvent& event)
         else if (x >= CONNECT_X && x <= CONNECT_X + CONNECT_WIDTH
             && y >= CONNECT_Y && y <= CONNECT_Y + CONNECT_HEIGHT)
         {
-            beginAsyncConnect();
+            beginAsyncConnect(false);
             return;
         }
 
@@ -1082,7 +1146,7 @@ void handleConnectionEvent(const XEvent& event)
 
     if (keysym == XK_Return || keysym == XK_KP_Enter)
     {
-        beginAsyncConnect();
+        beginAsyncConnect(false);
         return;
     }
 

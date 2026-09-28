@@ -90,48 +90,35 @@ int main()
     printLocalIPv4Addresses(SERVER_PORT);
     std::cout << "windows server waiting on 0.0.0.0:" << SERVER_PORT << " ..." << std::endl;
 
-    g_client_socket = acceptClient(g_server_socket);
-    if (g_client_socket == INVALID_SOCKET) {
-        std::cout << "accept failed" << std::endl;
-        closesocket(g_server_socket);
-        WSACleanup();
-        return 1;
-    }
+    while (true) {
+        g_client_socket = acceptClient(g_server_socket);
+        if (g_client_socket == INVALID_SOCKET) {
+            std::cout << "accept failed; retrying" << std::endl;
+            Sleep(100);
+            continue;
+        }
 
-    std::cout << "linux client connected" << std::endl;
+        std::cout << "client connected" << std::endl;
+        g_running = true;
 
-    g_running = true;
+        sendHello(g_client_socket, "hello from windows server");
 
-    sendHello(g_client_socket, "hello from windows server");
+        std::thread screen_thread(screenSendLoop, g_client_socket);
 
-    std::thread screen_thread(screenSendLoop, g_client_socket);
-
-    recvLoop(g_client_socket);
-
-    g_running = false;
-
-    if (g_client_socket != INVALID_SOCKET) {
+        recvLoop(g_client_socket);
+        g_running = false;
         shutdown(g_client_socket, SD_BOTH);
-    }
 
-    if (screen_thread.joinable()) {
-        screen_thread.join();
-    }
+        if (screen_thread.joinable()) {
+            screen_thread.join();
+        }
 
-    if (g_client_socket != INVALID_SOCKET) {
         closesocket(g_client_socket);
         g_client_socket = INVALID_SOCKET;
+
+        std::cout << "client disconnected; waiting for reconnect"
+                  << std::endl;
     }
-
-    if (g_server_socket != INVALID_SOCKET) {
-        closesocket(g_server_socket);
-        g_server_socket = INVALID_SOCKET;
-    }
-
-    WSACleanup();
-    std::cout << "windows server stopped" << std::endl;
-
-    return 0;
 }
 
 bool initServer(int port)
@@ -843,7 +830,8 @@ bool sendRealScreenFrame(
     ReleaseDC(NULL, screen_dc);
     auto t1 = std::chrono::steady_clock::now();
 
-    if (previous_width == width
+    if (frame_id > 1
+        && previous_width == width
         && previous_height == height
         && previous_frame.size() == frame.size()
         && memcmp(previous_frame.data(), frame.data(), frame.size()) == 0) {

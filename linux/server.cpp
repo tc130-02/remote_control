@@ -951,7 +951,8 @@ bool sendRealScreenFrame(
 
     auto t2 = std::chrono::steady_clock::now();
 
-    if (previous_width == width
+    if (frame_id > 1
+        && previous_width == width
         && previous_height == height
         && previous_frame.size() == rgb.size()
         && memcmp(previous_frame.data(), rgb.data(), rgb.size()) == 0)
