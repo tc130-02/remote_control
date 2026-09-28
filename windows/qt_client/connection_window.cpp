@@ -3,11 +3,14 @@
 #include "heartbeat.h"
 #include "packet.h"
 #include "reconnect.h"
+#include "remote_screen_widget.h"
 
 #include <QAbstractSocket>
 #include <QCloseEvent>
 #include <QFormLayout>
 #include <QFrame>
+#include <QFutureWatcher>
+#include <QImage>
 #include <QLabel>
 #include <QLineEdit>
 #include <QPushButton>
@@ -16,11 +19,15 @@
 #include <QTcpSocket>
 #include <QTimer>
 #include <QVBoxLayout>
+#include <QtConcurrent>
 
 #include <cstring>
+#include <utility>
 #include <vector>
 
 namespace {
+
+constexpr qint64 MAX_SCREEN_FRAME_BYTES = 256LL * 1024 * 1024;
 
 Packet buildTextPacket(std::int32_t command, const QByteArray& text)
 {
@@ -45,12 +52,18 @@ ConnectionWindow::ConnectionWindow(QWidget* parent)
       connectButton_(new QPushButton(this)),
       statusValue_(new QLabel(this)),
       detailsValue_(new QLabel(this)),
+      frameInfoValue_(new QLabel(this)),
+      screenWidget_(new RemoteScreenWidget(this)),
       socket_(new QTcpSocket(this)),
       heartbeatTimer_(new QTimer(this)),
       reconnectTimer_(new QTimer(this)),
+      decodeWatcher_(new QFutureWatcher<QImage>(this)),
       lastReceiveMs_(0),
       lastPingMs_(0),
       heartbeatSequence_(1),
+      receivedFrameBytes_(0),
+      screenGeneration_(0),
+      droppedDecodeFrames_(0),
       reconnectAttempt_(0),
       reconnecting_(false),
       connectedSession_(false),
@@ -58,7 +71,8 @@ ConnectionWindow::ConnectionWindow(QWidget* parent)
       manualDisconnect_(false)
 {
     setWindowTitle("Remote Control - Qt Client");
-    setMinimumWidth(460);
+    resize(1100, 780);
+    setMinimumSize(700, 560);
 
     auto* title = new QLabel("Remote Control", this);
     QFont titleFont = title->font();
@@ -94,6 +108,7 @@ ConnectionWindow::ConnectionWindow(QWidget* parent)
 
     detailsValue_->setWordWrap(true);
     detailsValue_->setTextInteractionFlags(Qt::TextSelectableByMouse);
+    frameInfoValue_->setText("No remote frame received.");
 
     connectButton_->setDefault(true);
     connectButton_->setMinimumHeight(36);
@@ -110,6 +125,8 @@ ConnectionWindow::ConnectionWindow(QWidget* parent)
     layout->addWidget(statusCaption);
     layout->addWidget(statusValue_);
     layout->addWidget(detailsValue_);
+    layout->addWidget(frameInfoValue_);
+    layout->addWidget(screenWidget_, 1);
 
     heartbeatTimer_->setInterval(HEARTBEAT_POLL_MS);
     reconnectTimer_->setSingleShot(true);
@@ -142,6 +159,14 @@ ConnectionWindow::ConnectionWindow(QWidget* parent)
     connect(reconnectTimer_, &QTimer::timeout, this, [this]() {
         startConnect(true);
     });
+    connect(
+        decodeWatcher_,
+        &QFutureWatcher<QImage>::finished,
+        this,
+        [this]() {
+            handleFrameDecoded();
+        }
+    );
 
     setStatus("Disconnected", "Enter a server address, then select Connect.");
     updateControls();
@@ -194,6 +219,7 @@ void ConnectionWindow::startConnect(bool reconnectAttempt)
     reconnectTimer_->stop();
     receiveBuffer_.clear();
     lastFailure_.clear();
+    resetScreenPipeline("Waiting for the first remote frame...");
     reconnecting_ = reconnectAttempt;
     connectedSession_ = false;
     disconnectHandled_ = false;
@@ -264,6 +290,7 @@ void ConnectionWindow::handleDisconnected()
     disconnectHandled_ = true;
     heartbeatTimer_->stop();
     receiveBuffer_.clear();
+    resetScreenPipeline("Disconnected from the remote screen.");
 
     const bool shouldReconnect = connectedSession_ || reconnecting_;
     connectedSession_ = false;
@@ -337,6 +364,21 @@ void ConnectionWindow::processReceiveBuffer()
 
 void ConnectionWindow::handlePacket(const Packet& packet)
 {
+    if (packet.cmd == CMD_SCREEN_BEGIN) {
+        beginScreenFrame(packet);
+        return;
+    }
+
+    if (packet.cmd == CMD_SCREEN_CHUNK) {
+        appendScreenChunk(packet);
+        return;
+    }
+
+    if (packet.cmd == CMD_SCREEN_END) {
+        finishScreenFrame(packet);
+        return;
+    }
+
     if (packet.cmd == CMD_HEARTBEAT_PING) {
         HeartbeatPayload payload = {};
         if (!readHeartbeatPayload(packet, payload)) {
@@ -371,6 +413,188 @@ void ConnectionWindow::handlePacket(const Packet& packet)
                 .arg(heartbeatNowMs() - payload.sent_at_ms)
         );
     }
+}
+
+void ConnectionWindow::beginScreenFrame(const Packet& packet)
+{
+    discardReceivingFrame();
+
+    if (packet.body_len != sizeof(ScreenFrameInfo)) {
+        return;
+    }
+
+    ScreenFrameInfo info = {};
+    std::memcpy(&info, packet.data, sizeof(info));
+
+    const qint64 rawSize =
+        static_cast<qint64>(info.width) * info.height * 4;
+    if (info.width <= 0
+        || info.height <= 0
+        || info.total_size <= 0
+        || rawSize <= 0
+        || rawSize > MAX_SCREEN_FRAME_BYTES
+        || info.total_size > MAX_SCREEN_FRAME_BYTES) {
+        return;
+    }
+
+    if (info.format != SCREEN_FORMAT_JPEG
+        && info.format != SCREEN_FORMAT_BGRA32) {
+        return;
+    }
+
+    if (info.format == SCREEN_FORMAT_BGRA32
+        && rawSize != info.total_size) {
+        return;
+    }
+
+    receivingFrame_.frameId = info.frame_id;
+    receivingFrame_.width = info.width;
+    receivingFrame_.height = info.height;
+    receivingFrame_.format = info.format;
+    receivingFrame_.generation = screenGeneration_;
+    receivingFrame_.data.resize(info.total_size);
+    receivedFrameBytes_ = 0;
+}
+
+void ConnectionWindow::appendScreenChunk(const Packet& packet)
+{
+    if (!receivingFrame_.valid()
+        || packet.body_len < sizeof(ScreenChunkHeader)) {
+        discardReceivingFrame();
+        return;
+    }
+
+    ScreenChunkHeader header = {};
+    std::memcpy(&header, packet.data, sizeof(header));
+
+    const qint64 chunkEnd =
+        static_cast<qint64>(header.offset) + header.data_len;
+    if (header.frame_id != receivingFrame_.frameId
+        || header.data_len <= 0
+        || header.offset != receivedFrameBytes_
+        || sizeof(ScreenChunkHeader) + header.data_len != packet.body_len
+        || chunkEnd > receivingFrame_.data.size()) {
+        discardReceivingFrame();
+        return;
+    }
+
+    std::memcpy(
+        receivingFrame_.data.data() + header.offset,
+        packet.data + sizeof(ScreenChunkHeader),
+        header.data_len
+    );
+    receivedFrameBytes_ += header.data_len;
+}
+
+void ConnectionWindow::finishScreenFrame(const Packet& packet)
+{
+    if (packet.body_len != sizeof(std::int32_t)) {
+        discardReceivingFrame();
+        return;
+    }
+
+    std::int32_t frameId = -1;
+    std::memcpy(&frameId, packet.data, sizeof(frameId));
+
+    if (!receivingFrame_.valid()
+        || frameId != receivingFrame_.frameId
+        || receivedFrameBytes_ != receivingFrame_.data.size()) {
+        discardReceivingFrame();
+        return;
+    }
+
+    ScreenFrame completed = std::move(receivingFrame_);
+    receivedFrameBytes_ = 0;
+    queueFrameForDecode(std::move(completed));
+}
+
+void ConnectionWindow::discardReceivingFrame()
+{
+    receivingFrame_ = ScreenFrame();
+    receivedFrameBytes_ = 0;
+}
+
+void ConnectionWindow::queueFrameForDecode(ScreenFrame frame)
+{
+    if (decodeWatcher_->isRunning()) {
+        if (pendingDecodeFrame_.valid()) {
+            ++droppedDecodeFrames_;
+        }
+        pendingDecodeFrame_ = std::move(frame);
+        return;
+    }
+
+    startFrameDecode(std::move(frame));
+}
+
+void ConnectionWindow::startFrameDecode(ScreenFrame frame)
+{
+    decodingFrame_ = std::move(frame);
+    const ScreenFrame decodeInput = decodingFrame_;
+
+    decodeWatcher_->setFuture(QtConcurrent::run([decodeInput]() {
+        QImage image;
+        if (decodeInput.format == SCREEN_FORMAT_JPEG) {
+            image = QImage::fromData(decodeInput.data, "JPEG");
+        } else if (decodeInput.format == SCREEN_FORMAT_BGRA32) {
+            image = QImage(
+                reinterpret_cast<const uchar*>(decodeInput.data.constData()),
+                decodeInput.width,
+                decodeInput.height,
+                decodeInput.width * 4,
+                QImage::Format_ARGB32
+            ).copy();
+        }
+
+        if (image.width() != decodeInput.width
+            || image.height() != decodeInput.height) {
+            return QImage();
+        }
+
+        return image;
+    }));
+}
+
+void ConnectionWindow::handleFrameDecoded()
+{
+    const QImage image = decodeWatcher_->result();
+    if (decodingFrame_.generation == screenGeneration_) {
+        if (!image.isNull()) {
+            screenWidget_->setFrame(image);
+            frameInfoValue_->setText(
+                QString("Frame %1 | %2 x %3 | %4 KiB | dropped %5")
+                    .arg(decodingFrame_.frameId)
+                    .arg(decodingFrame_.width)
+                    .arg(decodingFrame_.height)
+                    .arg(decodingFrame_.data.size() / 1024)
+                    .arg(droppedDecodeFrames_)
+            );
+        } else {
+            frameInfoValue_->setText(
+                QString("Frame %1 could not be decoded.")
+                    .arg(decodingFrame_.frameId)
+            );
+        }
+    }
+
+    decodingFrame_ = ScreenFrame();
+    if (pendingDecodeFrame_.valid()) {
+        ScreenFrame nextFrame = std::move(pendingDecodeFrame_);
+        pendingDecodeFrame_ = ScreenFrame();
+        if (nextFrame.generation == screenGeneration_) {
+            startFrameDecode(std::move(nextFrame));
+        }
+    }
+}
+
+void ConnectionWindow::resetScreenPipeline(const QString& message)
+{
+    ++screenGeneration_;
+    discardReceivingFrame();
+    pendingDecodeFrame_ = ScreenFrame();
+    droppedDecodeFrames_ = 0;
+    frameInfoValue_->setText("No remote frame received.");
+    screenWidget_->clearFrame(message);
 }
 
 void ConnectionWindow::pollHeartbeat()
