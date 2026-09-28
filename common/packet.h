@@ -28,7 +28,10 @@ enum CmdType : int32_t {
 
     CMD_SCREEN_BEGIN = 20,
     CMD_SCREEN_CHUNK = 21,
-    CMD_SCREEN_END = 22
+    CMD_SCREEN_END = 22,
+
+    CMD_HEARTBEAT_PING = 30,
+    CMD_HEARTBEAT_PONG = 31
 };
 
 enum MouseAction : int32_t {

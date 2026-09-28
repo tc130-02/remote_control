@@ -71,6 +71,7 @@ MouseEvent          16 bytes
 KeyEvent            36 bytes
 ScreenFrameInfo     20 bytes
 ScreenChunkHeader   12 bytes
+HeartbeatPayload    16 bytes
 ```
 
 屏幕传输仍使用原有三阶段流程：
@@ -105,6 +106,23 @@ SCREEN_FORMAT_JPEG = 1
 ```
 
 客户端只有在收到匹配的 `SCREEN_BEGIN`、连续完整的所有分片和对应 `SCREEN_END`，且累计字节数严格等于 `total_size` 后才会解码。新帧开始时会清理未完成旧帧。
+
+## 连接心跳
+
+Windows/Linux 的 server 和 client 使用同一套双向心跳：
+
+```text
+CMD_HEARTBEAT_PING(sequence, sent_at_ms)
+CMD_HEARTBEAT_PONG(sequence, sent_at_ms)
+```
+
+- 连续 3 秒没有收到完整有效包时发送 `PING`。
+- 收到 `PING` 后原样回传负载，并将命令改为 `PONG`。
+- 收到任意完整有效包都会刷新最近活动时间。
+- 连续 10 秒没有收到完整有效包时主动关闭连接。
+- 画面线程、输入线程和心跳处理共用发包互斥锁，防止两个 TCP 消息的字节交叉写入。
+
+心跳只负责发现失效连接并结束当前会话，不会自动重新连接。
 
 ## JPEG 编码
 
@@ -361,8 +379,9 @@ cpolar tcp 9999
 5. 检查画面四角的鼠标坐标映射。
 6. 遮挡、最小化并恢复窗口，检查最近一帧重绘。
 7. 断线后重新连接，并测试远程分辨率变化。
-8. 通过局域网和 cpolar 分别观察日志和画面时效性。
-9. 在不同 X11 Visual、DPI、窗口管理器和桌面分辨率下验证显示。
+8. 让对端保持连接但停止回复心跳，确认约 10 秒后回到断开状态。
+9. 通过局域网和 cpolar 分别观察日志和画面时效性。
+10. 在不同 X11 Visual、DPI、窗口管理器和桌面分辨率下验证显示。
 
 ## 说明
 

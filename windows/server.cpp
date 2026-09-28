@@ -12,6 +12,7 @@
 #include <cstdlib>
 #include <vector>
 #include <thread>
+#include <mutex>
 #include <atomic>
 #include <algorithm>
 #include <chrono>
@@ -34,7 +35,7 @@
 #pragma comment(lib, "user32.lib")
 #endif
 
-#include "../common/packet.h"
+#include "../common/heartbeat.h"
 
 const int SERVER_PORT = 9999;
 const int RECV_BUFFER_SIZE = 262144;
@@ -45,6 +46,7 @@ const int JPEG_QUALITY = 75;
 SOCKET g_server_socket = INVALID_SOCKET;
 SOCKET g_client_socket = INVALID_SOCKET;
 std::atomic<bool> g_running(false);
+std::mutex g_send_mutex;
 
 bool initServer(int port);
 void printLocalIPv4Addresses(int port);
@@ -64,7 +66,7 @@ bool sendAll(SOCKET sock, const char* buf, int len);
 bool sendPacket(SOCKET sock, const Packet& pkt);
 void sendHello(SOCKET sock, const char* msg);
 
-void handlePacket(const Packet& pkt);
+bool handlePacket(SOCKET client_socket, const Packet& pkt);
 void handleMouseEvent(const char* data, int len);
 void handleKeyEvent(const char* data, int len);
 void handleOldMouseMove(const char* data);
@@ -110,12 +112,15 @@ int main()
 
     if (g_client_socket != INVALID_SOCKET) {
         shutdown(g_client_socket, SD_BOTH);
-        closesocket(g_client_socket);
-        g_client_socket = INVALID_SOCKET;
     }
 
     if (screen_thread.joinable()) {
         screen_thread.join();
+    }
+
+    if (g_client_socket != INVALID_SOCKET) {
+        closesocket(g_client_socket);
+        g_client_socket = INVALID_SOCKET;
     }
 
     if (g_server_socket != INVALID_SOCKET) {
@@ -332,6 +337,7 @@ bool sendPacket(SOCKET sock, const Packet& pkt)
         return false;
     }
 
+    std::lock_guard<std::mutex> lock(g_send_mutex);
     bool ok = sendAll(sock, buf, len);
     free(buf);
 
@@ -350,13 +356,58 @@ void recvLoop(SOCKET client_socket)
 {
     char buffer[RECV_BUFFER_SIZE] = { 0 };
     int offset = 0;
+    int64_t last_receive_ms = heartbeatNowMs();
+    int64_t last_ping_ms = last_receive_ms - HEARTBEAT_IDLE_MS;
+    int64_t heartbeat_sequence = 1;
+    bool connection_ok = true;
 
-    while (g_running) {
+    while (g_running && connection_ok) {
+        int64_t now_ms = heartbeatNowMs();
+        if (now_ms - last_receive_ms >= HEARTBEAT_TIMEOUT_MS) {
+            std::cout << "heartbeat timeout; closing client" << std::endl;
+            break;
+        }
+
+        if (now_ms - last_receive_ms >= HEARTBEAT_IDLE_MS
+            && now_ms - last_ping_ms >= HEARTBEAT_IDLE_MS) {
+            Packet ping = buildHeartbeatPacket(
+                CMD_HEARTBEAT_PING,
+                heartbeat_sequence++
+            );
+            if (!sendPacket(client_socket, ping)) {
+                break;
+            }
+            last_ping_ms = now_ms;
+        }
+
         int free_size = RECV_BUFFER_SIZE - offset;
         if (free_size <= 0) {
             std::cout << "recv buffer full, reset buffer" << std::endl;
             offset = 0;
             free_size = RECV_BUFFER_SIZE;
+        }
+
+        fd_set read_fds;
+        FD_ZERO(&read_fds);
+        FD_SET(client_socket, &read_fds);
+
+        timeval timeout = {};
+        timeout.tv_sec = HEARTBEAT_POLL_MS / 1000;
+        timeout.tv_usec = (HEARTBEAT_POLL_MS % 1000) * 1000;
+
+        int ready = select(0, &read_fds, nullptr, nullptr, &timeout);
+        if (ready == SOCKET_ERROR) {
+            int error_code = WSAGetLastError();
+            if (error_code == WSAEINTR) {
+                continue;
+            }
+
+            std::cout << "select failed: " << error_code << std::endl;
+            break;
+        }
+
+        if (ready == 0) {
+            continue;
         }
 
         int len = recv(client_socket, buffer + offset, free_size, 0);
@@ -396,7 +447,11 @@ void recvLoop(SOCKET client_socket)
             }
 
             Packet pkt = decodePacket(buffer);
-            handlePacket(pkt);
+            if (!handlePacket(client_socket, pkt)) {
+                connection_ok = false;
+                break;
+            }
+            last_receive_ms = heartbeatNowMs();
 
             int pack_size = PACKET_HEADER_SIZE + body_len;
             memmove(buffer, buffer + pack_size, offset - pack_size);
@@ -407,11 +462,11 @@ void recvLoop(SOCKET client_socket)
     g_running = false;
 }
 
-void handlePacket(const Packet& pkt)
+bool handlePacket(SOCKET client_socket, const Packet& pkt)
 {
     if (pkt.magic != PACKET_MAGIC) {
         std::cout << "invalid packet magic" << std::endl;
-        return;
+        return false;
     }
 
     if (pkt.cmd == CMD_HELLO) {
@@ -432,9 +487,35 @@ void handlePacket(const Packet& pkt)
     else if (pkt.cmd == CMD_KEY_EVENT) {
         handleKeyEvent(pkt.data, pkt.body_len);
     }
+    else if (pkt.cmd == CMD_HEARTBEAT_PING) {
+        HeartbeatPayload payload = {};
+        if (!readHeartbeatPayload(pkt, payload)) {
+            std::cout << "invalid heartbeat ping" << std::endl;
+            return false;
+        }
+
+        Packet pong = pkt;
+        pong.cmd = CMD_HEARTBEAT_PONG;
+        if (!sendPacket(client_socket, pong)) {
+            return false;
+        }
+    }
+    else if (pkt.cmd == CMD_HEARTBEAT_PONG) {
+        HeartbeatPayload payload = {};
+        if (!readHeartbeatPayload(pkt, payload)) {
+            std::cout << "invalid heartbeat pong" << std::endl;
+            return false;
+        }
+
+        std::cout << "heartbeat pong sequence=" << payload.sequence
+                  << " rtt_ms=" << heartbeatNowMs() - payload.sent_at_ms
+                  << std::endl;
+    }
     else {
         std::cout << "unknown cmd=" << pkt.cmd << " len=" << pkt.body_len << std::endl;
     }
+
+    return true;
 }
 
 void handleOldMouseMove(const char* data)

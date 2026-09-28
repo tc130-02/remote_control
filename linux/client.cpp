@@ -30,7 +30,7 @@
 #define STB_IMAGE_IMPLEMENTATION
 #include "../third_party/stb_image.h"
 
-#include "../common/packet.h"
+#include "../common/heartbeat.h"
 
 const long long MAX_PROTOCOL_FRAME_SIZE = INT_MAX;
 
@@ -164,6 +164,7 @@ std::atomic<bool> g_app_running(true);
 std::atomic<bool> g_connecting(false);
 std::thread g_connect_thread;
 std::mutex g_connect_mutex;
+std::mutex g_send_mutex;
 int g_pending_connect_socket = -1;
 int g_connect_result_socket = -1;
 bool g_connect_result_ready = false;
@@ -256,7 +257,7 @@ void handleScreenBegin(const Packet& pkt);
 void handleScreenChunk(const Packet& pkt);
 void handleScreenEnd(const Packet& pkt);
 
-void handlePacket(const Packet& pkt);
+bool handlePacket(int sock, const Packet& pkt);
 void recvLoop(int sock);
 
 int main(int argc, char* argv[])
@@ -735,6 +736,7 @@ bool sendPacket(int sock, const Packet& pkt)
         return false;
     }
 
+    std::lock_guard<std::mutex> lock(g_send_mutex);
     bool ok = sendAll(sock, buf, len);
 
     free(buf);
@@ -1921,12 +1923,12 @@ void handleScreenEnd(const Packet& pkt)
     discardReceivingFrame();
 }
 
-void handlePacket(const Packet& pkt)
+bool handlePacket(int sock, const Packet& pkt)
 {
     if (pkt.magic != PACKET_MAGIC)
     {
         std::cout << "invalid magic" << std::endl;
-        return;
+        return false;
     }
 
     switch (pkt.cmd)
@@ -1949,21 +1951,84 @@ void handlePacket(const Packet& pkt)
         handleScreenEnd(pkt);
         break;
 
+    case CMD_HEARTBEAT_PING:
+    {
+        HeartbeatPayload payload = {};
+        if (!readHeartbeatPayload(pkt, payload))
+        {
+            std::cout << "invalid heartbeat ping" << std::endl;
+            return false;
+        }
+
+        Packet pong = pkt;
+        pong.cmd = CMD_HEARTBEAT_PONG;
+        if (!sendPacket(sock, pong))
+        {
+            return false;
+        }
+        break;
+    }
+
+    case CMD_HEARTBEAT_PONG:
+    {
+        HeartbeatPayload payload = {};
+        if (!readHeartbeatPayload(pkt, payload))
+        {
+            std::cout << "invalid heartbeat pong" << std::endl;
+            return false;
+        }
+
+        std::cout << "heartbeat pong sequence=" << payload.sequence
+                  << " rtt_ms=" << heartbeatNowMs() - payload.sent_at_ms
+                  << std::endl;
+        break;
+    }
+
     default:
         std::cout << "unknown cmd=" << pkt.cmd
                   << " len=" << pkt.body_len
                   << std::endl;
         break;
     }
+
+    return true;
 }
 
 void recvLoop(int sock)
 {
     char buffer[262144] = {0};
     int offset = 0;
+    int64_t last_receive_ms = heartbeatNowMs();
+    int64_t last_ping_ms = last_receive_ms - HEARTBEAT_IDLE_MS;
+    int64_t heartbeat_sequence = 1;
+    bool connection_ok = true;
 
-    while (g_app_running && g_client_state == ClientState::CONNECTED)
+    while (g_app_running
+        && g_client_state == ClientState::CONNECTED
+        && connection_ok)
     {
+        int64_t now_ms = heartbeatNowMs();
+        if (now_ms - last_receive_ms >= HEARTBEAT_TIMEOUT_MS)
+        {
+            std::cout << "heartbeat timeout; closing server connection"
+                      << std::endl;
+            break;
+        }
+
+        if (now_ms - last_receive_ms >= HEARTBEAT_IDLE_MS
+            && now_ms - last_ping_ms >= HEARTBEAT_IDLE_MS)
+        {
+            Packet ping = buildHeartbeatPacket(
+                CMD_HEARTBEAT_PING,
+                heartbeat_sequence++
+            );
+            if (!sendPacket(sock, ping))
+            {
+                break;
+            }
+            last_ping_ms = now_ms;
+        }
+
         if (offset >= (int)sizeof(buffer))
         {
             std::cout << "recv buffer full, protocol error" << std::endl;
@@ -2047,7 +2112,12 @@ void recvLoop(int sock)
             }
 
             Packet pkt = decodePacket(buffer);
-            handlePacket(pkt);
+            if (!handlePacket(sock, pkt))
+            {
+                connection_ok = false;
+                break;
+            }
+            last_receive_ms = heartbeatNowMs();
 
             int remain = offset - packet_size;
 

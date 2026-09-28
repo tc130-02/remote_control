@@ -3,6 +3,7 @@
 #include <arpa/inet.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <sys/select.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <netdb.h>
@@ -14,6 +15,7 @@
 #include <X11/Xlib.h>
 #include <X11/Xutil.h>
 #include <thread>
+#include <mutex>
 #include <atomic>
 #include <chrono>
 #include <cerrno>
@@ -32,11 +34,11 @@
 #pragma GCC diagnostic pop
 #endif
 
-#include "../common/packet.h"
+#include "../common/heartbeat.h"
 
 void handleMouseMove(const char *data);
 void handleKeyPress(const char *data);
-void handlePacket(const Packet &pkt);
+bool handlePacket(int client_fd, const Packet &pkt);
 void handleMouseClick(const char *data);
 void handleMouseEvent(const char *data, int len);
 void handleKeyEvent(const char *data, int len);
@@ -135,6 +137,7 @@ void screenSendLoop(int client_fd);
 void recvLoop(int client_fd);
 
 std::atomic<bool> g_running(true);
+std::mutex g_send_mutex;
 
 const int SERVER_PORT = 9999;
 const int MIN_FRAME_INTERVAL_MS = 50;
@@ -227,12 +230,12 @@ void handleKeyPress(const char *data)
     std::cout << "key press: " << data << std::endl;
 }
 
-void handlePacket(const Packet &pkt)
+bool handlePacket(int client_fd, const Packet &pkt)
 {
     if (pkt.magic != PACKET_MAGIC)
     {
         std::cout << "invalid packet magic: " << pkt.magic << std::endl;
-        return;
+        return false;
     }
 
     if (pkt.cmd == CMD_HELLO)
@@ -259,10 +262,41 @@ void handlePacket(const Packet &pkt)
     {
         handleKeyEvent(pkt.data, pkt.body_len);
     }
+    else if (pkt.cmd == CMD_HEARTBEAT_PING)
+    {
+        HeartbeatPayload payload = {};
+        if (!readHeartbeatPayload(pkt, payload))
+        {
+            std::cout << "invalid heartbeat ping" << std::endl;
+            return false;
+        }
+
+        Packet pong = pkt;
+        pong.cmd = CMD_HEARTBEAT_PONG;
+        if (!sendPacket(client_fd, pong))
+        {
+            return false;
+        }
+    }
+    else if (pkt.cmd == CMD_HEARTBEAT_PONG)
+    {
+        HeartbeatPayload payload = {};
+        if (!readHeartbeatPayload(pkt, payload))
+        {
+            std::cout << "invalid heartbeat pong" << std::endl;
+            return false;
+        }
+
+        std::cout << "heartbeat pong sequence=" << payload.sequence
+                  << " rtt_ms=" << heartbeatNowMs() - payload.sent_at_ms
+                  << std::endl;
+    }
     else
     {
         std::cout << "unknown command: " << pkt.cmd << std::endl;
     }
+
+    return true;
 }
 
 int createServerSocket(int port)
@@ -391,13 +425,70 @@ void recvLoop(int client_fd)
 {
     char buffer[262144] = {0};
     int offset = 0;
+    int64_t last_receive_ms = heartbeatNowMs();
+    int64_t last_ping_ms = last_receive_ms - HEARTBEAT_IDLE_MS;
+    int64_t heartbeat_sequence = 1;
+    bool connection_ok = true;
 
-    while (true)
+    while (connection_ok)
     {
+        int64_t now_ms = heartbeatNowMs();
+        if (now_ms - last_receive_ms >= HEARTBEAT_TIMEOUT_MS)
+        {
+            std::cout << "heartbeat timeout; closing client" << std::endl;
+            break;
+        }
+
+        if (now_ms - last_receive_ms >= HEARTBEAT_IDLE_MS
+            && now_ms - last_ping_ms >= HEARTBEAT_IDLE_MS)
+        {
+            Packet ping = buildHeartbeatPacket(
+                CMD_HEARTBEAT_PING,
+                heartbeat_sequence++
+            );
+            if (!sendPacket(client_fd, ping))
+            {
+                break;
+            }
+            last_ping_ms = now_ms;
+        }
+
         if (offset >= (int)sizeof(buffer))
         {
             std::cout << "recv buffer full, protocol error" << std::endl;
             break;
+        }
+
+        fd_set read_fds;
+        FD_ZERO(&read_fds);
+        FD_SET(client_fd, &read_fds);
+
+        timeval timeout = {};
+        timeout.tv_sec = HEARTBEAT_POLL_MS / 1000;
+        timeout.tv_usec = (HEARTBEAT_POLL_MS % 1000) * 1000;
+
+        int ready = select(
+            client_fd + 1,
+            &read_fds,
+            nullptr,
+            nullptr,
+            &timeout
+        );
+
+        if (ready < 0)
+        {
+            if (errno == EINTR)
+            {
+                continue;
+            }
+
+            std::cout << "select failed: " << strerror(errno) << std::endl;
+            break;
+        }
+
+        if (ready == 0)
+        {
+            continue;
         }
 
         int len = recv(client_fd, buffer + offset, sizeof(buffer) - offset, 0);
@@ -442,7 +533,12 @@ void recvLoop(int client_fd)
 
             Packet pkt = decodePacket(buffer);
 
-            handlePacket(pkt);
+            if (!handlePacket(client_fd, pkt))
+            {
+                connection_ok = false;
+                break;
+            }
+            last_receive_ms = heartbeatNowMs();
 
             int pack_size = PACKET_HEADER_SIZE + body_len;
 
@@ -674,6 +770,7 @@ bool sendPacket(int sock, const Packet &pkt)
         return false;
     }
 
+    std::lock_guard<std::mutex> lock(g_send_mutex);
     bool ok = sendAll(sock, buf, len);
 
     free(buf);
