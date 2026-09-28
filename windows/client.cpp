@@ -1366,20 +1366,18 @@ bool sendAll(SOCKET sock, const char* buf, int len)
 
 bool sendPacket(SOCKET sock, const Packet& pkt)
 {
-    int len = 0;
+    std::vector<char> buffer = encodePacket(pkt);
 
-    char* buf = encodePacket(&pkt, &len);
-
-    if (buf == NULL || len <= 0) {
+    if (buffer.empty()) {
         return false;
     }
 
     std::lock_guard<std::mutex> lock(g_send_mutex);
-    bool ok = sendAll(sock, buf, len);
-
-    free(buf);
-
-    return ok;
+    return sendAll(
+        sock,
+        buffer.data(),
+        static_cast<int>(buffer.size())
+    );
 }
 
 void sendHello(SOCKET sock, const char* msg)

@@ -791,21 +791,20 @@ bool sendAll(int sock, const char* buf, int len)
 
 bool sendPacket(int sock, const Packet& pkt)
 {
-    int len = 0;
-    char* buf = encodePacket(&pkt, &len);
+    std::vector<char> buffer = encodePacket(pkt);
 
-    if (buf == NULL || len <= 0)
+    if (buffer.empty())
     {
         std::cout << "encodePacket failed" << std::endl;
         return false;
     }
 
     std::lock_guard<std::mutex> lock(g_send_mutex);
-    bool ok = sendAll(sock, buf, len);
-
-    free(buf);
-
-    return ok;
+    return sendAll(
+        sock,
+        buffer.data(),
+        static_cast<int>(buffer.size())
+    );
 }
 
 Packet buildPacket(int cmd, const char* msg)

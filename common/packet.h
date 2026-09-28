@@ -1,8 +1,8 @@
 #pragma once
 
 #include <cstdint>
-#include <cstdlib>
 #include <cstring>
+#include <vector>
 
 constexpr int32_t PACKET_DATA_SIZE = 65536;
 constexpr int32_t PACKET_HEADER_SIZE = 12;
@@ -90,41 +90,31 @@ static_assert(
     "Packet wire size changed"
 );
 
-inline char* encodePacket(const Packet* packet, int* output_length)
+inline std::vector<char> encodePacket(const Packet& packet)
 {
-    if (packet == nullptr || output_length == nullptr) {
-        return nullptr;
+    if (packet.body_len < 0 || packet.body_len > PACKET_DATA_SIZE) {
+        return {};
     }
 
-    if (packet->body_len < 0 || packet->body_len > PACKET_DATA_SIZE) {
-        *output_length = 0;
-        return nullptr;
-    }
+    std::vector<char> buffer(PACKET_HEADER_SIZE + packet.body_len);
 
-    *output_length = PACKET_HEADER_SIZE + packet->body_len;
-    char* buffer = static_cast<char*>(std::malloc(*output_length));
-    if (buffer == nullptr) {
-        *output_length = 0;
-        return nullptr;
-    }
-
-    std::memcpy(buffer, &packet->magic, sizeof(int32_t));
+    std::memcpy(buffer.data(), &packet.magic, sizeof(int32_t));
     std::memcpy(
-        buffer + sizeof(int32_t),
-        &packet->cmd,
+        buffer.data() + sizeof(int32_t),
+        &packet.cmd,
         sizeof(int32_t)
     );
     std::memcpy(
-        buffer + sizeof(int32_t) * 2,
-        &packet->body_len,
+        buffer.data() + sizeof(int32_t) * 2,
+        &packet.body_len,
         sizeof(int32_t)
     );
 
-    if (packet->body_len > 0) {
+    if (packet.body_len > 0) {
         std::memcpy(
-            buffer + PACKET_HEADER_SIZE,
-            packet->data,
-            packet->body_len
+            buffer.data() + PACKET_HEADER_SIZE,
+            packet.data,
+            packet.body_len
         );
     }
 

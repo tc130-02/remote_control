@@ -107,6 +107,8 @@ SCREEN_FORMAT_JPEG = 1
 
 客户端只有在收到匹配的 `SCREEN_BEGIN`、连续完整的所有分片和对应 `SCREEN_END`，且累计字节数严格等于 `total_size` 后才会解码。新帧开始时会清理未完成旧帧。
 
+协议编码缓冲区使用 `std::vector<char>` 管理。编码函数返回拥有内存所有权的对象，发包完成或函数提前返回时都会自动释放，不再要求四个端点手动配对 `malloc/free`。`vector` 同时保存连续地址和实际长度，适合直接传给同步 `send` 循环。
+
 ## 连接心跳
 
 Windows/Linux 的 server 和 client 使用同一套双向心跳：
