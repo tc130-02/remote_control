@@ -278,6 +278,26 @@ windows/build/win_server.exe
 windows/build/win_client.exe
 ```
 
+可选的 Qt 连接端界面使用 Qt 6 的 Widgets 和 Network 模块。通过 Qt 自带的 CMake 包装器构建，可以避免把某个开发者本机的 Qt 安装路径写入项目：
+
+```powershell
+D:\Qt\6.11.2\mingw_64\bin\qt-cmake.bat `
+    -S windows -B build/qt-client -G Ninja `
+    -DBUILD_QT_CLIENT=ON
+
+D:\Qt\Tools\CMake_64\bin\cmake.exe `
+    --build build/qt-client --target qt_client
+```
+
+当前 `qt_client` 是第一阶段的连接管理窗口，支持地址和端口保存、连接状态、协议心跳以及断线指数退避重连。远程画面显示和键鼠控制仍由 `win_client` 提供，后续会在独立审查步骤中迁移到 Qt。
+
+也可以从命令行预填地址并立即连接，便于本机联调：
+
+```powershell
+$env:Path = "D:\Qt\6.11.2\mingw_64\bin;D:\Qt\Tools\mingw1310_64\bin;$env:Path"
+.\build\qt-client\qt_client.exe --host 127.0.0.1 --port 9999 --connect
+```
+
 ### Linux
 
 安装依赖：
