@@ -141,6 +141,8 @@ CMD_HEARTBEAT_PONG(sequence, sent_at_ms)
 - Windows 和 Linux 服务端都会在当前客户端断开后返回 `accept`，等待下一次连接。
 - 每个新会话都会强制发送第一帧，即使远程桌面内容没有变化。
 
+服务端监听套接字和当前会话套接字使用不可复制、可移动的 `SocketHandle` 管理。会话结束时先调用 `shutdown` 唤醒可能阻塞的画面线程，等待线程退出后再由析构函数执行 `close`/`closesocket`。Windows 的 `WSAStartup/WSACleanup` 也由独立运行时对象成对管理。
+
 ## JPEG 编码
 
 ### Windows server
