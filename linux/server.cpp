@@ -147,32 +147,54 @@ int main()
 {
     int server_fd = createServerSocket(SERVER_PORT);
 
+    if (server_fd < 0)
+    {
+        return 1;
+    }
+
     printLocalIPv4Addresses(SERVER_PORT);
     std::cout << "server waiting on 0.0.0.0:" << SERVER_PORT << " ..." << std::endl;
 
-    int client_fd = acceptClient(server_fd);
+    while (true)
+    {
+        int client_fd = acceptClient(server_fd);
 
-    std::cout << "client connected" << std::endl;
+        if (client_fd < 0)
+        {
+            std::cout << "accept failed: " << strerror(errno) << std::endl;
+            continue;
+        }
 
-    Packet hello = {};
-    hello.magic = PACKET_MAGIC;
-    hello.cmd = CMD_HELLO;
+        std::cout << "client connected" << std::endl;
+        g_running = true;
 
-    const char *msg = "hello from linux server";
-    hello.body_len = strlen(msg);
-    memcpy(hello.data, msg, hello.body_len);
+        Packet hello = {};
+        hello.magic = PACKET_MAGIC;
+        hello.cmd = CMD_HELLO;
 
-    sendPacket(client_fd, hello);
+        const char *msg = "hello from linux server";
+        hello.body_len = strlen(msg);
+        memcpy(hello.data, msg, hello.body_len);
 
-    // A blocked screen send must not delay incoming keyboard or mouse events.
-    std::thread screen_thread(screenSendLoop, client_fd);
+        if (!sendPacket(client_fd, hello))
+        {
+            close(client_fd);
+            continue;
+        }
 
-    recvLoop(client_fd);
-    g_running = false;
-    shutdown(client_fd, SHUT_RDWR);
+        // A blocked screen send must not delay incoming keyboard or mouse events.
+        std::thread screen_thread(screenSendLoop, client_fd);
 
-    screen_thread.join();
-    close(client_fd);
+        recvLoop(client_fd);
+        g_running = false;
+        shutdown(client_fd, SHUT_RDWR);
+
+        screen_thread.join();
+        close(client_fd);
+
+        std::cout << "client disconnected; waiting for reconnect" << std::endl;
+    }
+
     close(server_fd);
 
     return 0;
@@ -247,14 +269,44 @@ int createServerSocket(int port)
 {
     int server_fd = socket(AF_INET, SOCK_STREAM, 0);
 
+    if (server_fd < 0)
+    {
+        std::cout << "socket failed: " << strerror(errno) << std::endl;
+        return -1;
+    }
+
+    int reuse_address = 1;
+    if (setsockopt(
+            server_fd,
+            SOL_SOCKET,
+            SO_REUSEADDR,
+            &reuse_address,
+            sizeof(reuse_address)
+        ) != 0)
+    {
+        std::cout << "set SO_REUSEADDR failed: " << strerror(errno) << std::endl;
+        close(server_fd);
+        return -1;
+    }
+
     sockaddr_in addr = {};
     addr.sin_family = AF_INET;
     addr.sin_port = htons(port);
     addr.sin_addr.s_addr = INADDR_ANY;
 
-    bind(server_fd, (sockaddr *)&addr, sizeof(addr));
+    if (bind(server_fd, (sockaddr *)&addr, sizeof(addr)) != 0)
+    {
+        std::cout << "bind failed: " << strerror(errno) << std::endl;
+        close(server_fd);
+        return -1;
+    }
 
-    listen(server_fd, 5);
+    if (listen(server_fd, 5) != 0)
+    {
+        std::cout << "listen failed: " << strerror(errno) << std::endl;
+        close(server_fd);
+        return -1;
+    }
 
     return server_fd;
 }
