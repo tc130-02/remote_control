@@ -55,3 +55,22 @@ client disconnected; waiting for reconnect
 client connected
 client disconnected; waiting for reconnect
 ```
+
+## Local GUI verification result
+
+The Windows GUI client and Linux server were tested on the same computer, with
+the server running in WSL and the client connecting to `127.0.0.1:9999`.
+
+The first Windows client process reported:
+
+```text
+Remote Control - connected to 127.0.0.1:9999
+```
+
+After that process was closed, a second Windows client process connected to the
+same still-running server and reported the same connected state. The server
+received `hello linux window client` in both sessions and returned to the accept
+loop after each disconnect.
+
+This verifies local process and session lifecycle behavior. It does not cover a
+physical two-machine network, firewall rules, or router isolation.
