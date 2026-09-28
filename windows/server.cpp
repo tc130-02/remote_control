@@ -36,6 +36,7 @@
 #endif
 
 #include "../common/heartbeat.h"
+#include "../common/socket_handle.h"
 
 const int SERVER_PORT = 9999;
 const int RECV_BUFFER_SIZE = 262144;
@@ -43,12 +44,10 @@ const long long MAX_PROTOCOL_FRAME_SIZE = INT_MAX;
 const int FRAME_INTERVAL_MS = 100;
 const int JPEG_QUALITY = 75;
 
-SOCKET g_server_socket = INVALID_SOCKET;
-SOCKET g_client_socket = INVALID_SOCKET;
 std::atomic<bool> g_running(false);
 std::mutex g_send_mutex;
 
-bool initServer(int port);
+SOCKET createServerSocket(int port);
 void printLocalIPv4Addresses(int port);
 SOCKET acceptClient(SOCKET server_socket);
 void recvLoop(SOCKET client_socket);
@@ -82,8 +81,15 @@ void sendKeyInput(WORD vk, bool key_down);
 
 int main()
 {
-    if (!initServer(SERVER_PORT)) {
-        std::cout << "init server failed" << std::endl;
+    WinsockRuntime winsock;
+    if (!winsock.valid()) {
+        std::cout << "WSAStartup failed: " << winsock.errorCode()
+                  << std::endl;
+        return 1;
+    }
+
+    SocketHandle server_socket(createServerSocket(SERVER_PORT));
+    if (!server_socket.valid()) {
         return 1;
     }
 
@@ -91,8 +97,8 @@ int main()
     std::cout << "windows server waiting on 0.0.0.0:" << SERVER_PORT << " ..." << std::endl;
 
     while (true) {
-        g_client_socket = acceptClient(g_server_socket);
-        if (g_client_socket == INVALID_SOCKET) {
+        SocketHandle client_socket(acceptClient(server_socket.get()));
+        if (!client_socket.valid()) {
             std::cout << "accept failed; retrying" << std::endl;
             Sleep(100);
             continue;
@@ -101,69 +107,60 @@ int main()
         std::cout << "client connected" << std::endl;
         g_running = true;
 
-        sendHello(g_client_socket, "hello from windows server");
+        sendHello(client_socket.get(), "hello from windows server");
 
-        std::thread screen_thread(screenSendLoop, g_client_socket);
+        std::thread screen_thread(screenSendLoop, client_socket.get());
 
-        recvLoop(g_client_socket);
+        recvLoop(client_socket.get());
         g_running = false;
-        shutdown(g_client_socket, SD_BOTH);
+        client_socket.shutdownBoth();
 
         if (screen_thread.joinable()) {
             screen_thread.join();
         }
-
-        closesocket(g_client_socket);
-        g_client_socket = INVALID_SOCKET;
 
         std::cout << "client disconnected; waiting for reconnect"
                   << std::endl;
     }
 }
 
-bool initServer(int port)
+SOCKET createServerSocket(int port)
 {
-    WSADATA wsaData;
-    int ret = WSAStartup(MAKEWORD(2, 2), &wsaData);
-    if (ret != 0) {
-        std::cout << "WSAStartup failed: " << ret << std::endl;
-        return false;
-    }
-
-    g_server_socket = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-    if (g_server_socket == INVALID_SOCKET) {
+    SocketHandle server_socket(
+        socket(AF_INET, SOCK_STREAM, IPPROTO_TCP)
+    );
+    if (!server_socket.valid()) {
         std::cout << "socket failed: " << WSAGetLastError() << std::endl;
-        WSACleanup();
-        return false;
+        return INVALID_SOCKET;
     }
 
     BOOL opt = TRUE;
-    setsockopt(g_server_socket, SOL_SOCKET, SO_REUSEADDR, (const char*)&opt, sizeof(opt));
+    setsockopt(
+        server_socket.get(),
+        SOL_SOCKET,
+        SO_REUSEADDR,
+        (const char*)&opt,
+        sizeof(opt)
+    );
 
     sockaddr_in addr = {};
     addr.sin_family = AF_INET;
     addr.sin_port = htons(port);
     addr.sin_addr.s_addr = htonl(INADDR_ANY);
 
-    ret = bind(g_server_socket, (sockaddr*)&addr, sizeof(addr));
+    int ret = bind(server_socket.get(), (sockaddr*)&addr, sizeof(addr));
     if (ret == SOCKET_ERROR) {
         std::cout << "bind failed: " << WSAGetLastError() << std::endl;
-        closesocket(g_server_socket);
-        g_server_socket = INVALID_SOCKET;
-        WSACleanup();
-        return false;
+        return INVALID_SOCKET;
     }
 
-    ret = listen(g_server_socket, 5);
+    ret = listen(server_socket.get(), 5);
     if (ret == SOCKET_ERROR) {
         std::cout << "listen failed: " << WSAGetLastError() << std::endl;
-        closesocket(g_server_socket);
-        g_server_socket = INVALID_SOCKET;
-        WSACleanup();
-        return false;
+        return INVALID_SOCKET;
     }
 
-    return true;
+    return server_socket.release();
 }
 
 void printLocalIPv4Addresses(int port)

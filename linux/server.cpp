@@ -35,6 +35,7 @@
 #endif
 
 #include "../common/heartbeat.h"
+#include "../common/socket_handle.h"
 
 void handleMouseMove(const char *data);
 void handleKeyPress(const char *data);
@@ -148,9 +149,9 @@ const long long MAX_PROTOCOL_FRAME_SIZE = INT_MAX;
 
 int main()
 {
-    int server_fd = createServerSocket(SERVER_PORT);
+    SocketHandle server_socket(createServerSocket(SERVER_PORT));
 
-    if (server_fd < 0)
+    if (!server_socket.valid())
     {
         return 1;
     }
@@ -160,9 +161,9 @@ int main()
 
     while (true)
     {
-        int client_fd = acceptClient(server_fd);
+        SocketHandle client_socket(acceptClient(server_socket.get()));
 
-        if (client_fd < 0)
+        if (!client_socket.valid())
         {
             std::cout << "accept failed: " << strerror(errno) << std::endl;
             continue;
@@ -179,28 +180,22 @@ int main()
         hello.body_len = strlen(msg);
         memcpy(hello.data, msg, hello.body_len);
 
-        if (!sendPacket(client_fd, hello))
+        if (!sendPacket(client_socket.get(), hello))
         {
-            close(client_fd);
             continue;
         }
 
         // A blocked screen send must not delay incoming keyboard or mouse events.
-        std::thread screen_thread(screenSendLoop, client_fd);
+        std::thread screen_thread(screenSendLoop, client_socket.get());
 
-        recvLoop(client_fd);
+        recvLoop(client_socket.get());
         g_running = false;
-        shutdown(client_fd, SHUT_RDWR);
+        client_socket.shutdownBoth();
 
         screen_thread.join();
-        close(client_fd);
 
         std::cout << "client disconnected; waiting for reconnect" << std::endl;
     }
-
-    close(server_fd);
-
-    return 0;
 }
 
 // Legacy text commands remain available for clients that predate MouseEvent.
@@ -301,9 +296,9 @@ bool handlePacket(int client_fd, const Packet &pkt)
 
 int createServerSocket(int port)
 {
-    int server_fd = socket(AF_INET, SOCK_STREAM, 0);
+    SocketHandle server_socket(socket(AF_INET, SOCK_STREAM, 0));
 
-    if (server_fd < 0)
+    if (!server_socket.valid())
     {
         std::cout << "socket failed: " << strerror(errno) << std::endl;
         return -1;
@@ -311,7 +306,7 @@ int createServerSocket(int port)
 
     int reuse_address = 1;
     if (setsockopt(
-            server_fd,
+            server_socket.get(),
             SOL_SOCKET,
             SO_REUSEADDR,
             &reuse_address,
@@ -319,7 +314,6 @@ int createServerSocket(int port)
         ) != 0)
     {
         std::cout << "set SO_REUSEADDR failed: " << strerror(errno) << std::endl;
-        close(server_fd);
         return -1;
     }
 
@@ -328,21 +322,19 @@ int createServerSocket(int port)
     addr.sin_port = htons(port);
     addr.sin_addr.s_addr = INADDR_ANY;
 
-    if (bind(server_fd, (sockaddr *)&addr, sizeof(addr)) != 0)
+    if (bind(server_socket.get(), (sockaddr *)&addr, sizeof(addr)) != 0)
     {
         std::cout << "bind failed: " << strerror(errno) << std::endl;
-        close(server_fd);
         return -1;
     }
 
-    if (listen(server_fd, 5) != 0)
+    if (listen(server_socket.get(), 5) != 0)
     {
         std::cout << "listen failed: " << strerror(errno) << std::endl;
-        close(server_fd);
         return -1;
     }
 
-    return server_fd;
+    return server_socket.release();
 }
 
 void printLocalIPv4Addresses(int port)
