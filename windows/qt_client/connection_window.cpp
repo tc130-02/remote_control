@@ -6,6 +6,7 @@
 #include "remote_screen_widget.h"
 
 #include <QAbstractSocket>
+#include <QCheckBox>
 #include <QCloseEvent>
 #include <QFormLayout>
 #include <QFrame>
@@ -50,6 +51,7 @@ ConnectionWindow::ConnectionWindow(QWidget* parent)
       hostEdit_(new QLineEdit(this)),
       portSpin_(new QSpinBox(this)),
       connectButton_(new QPushButton(this)),
+      inputEnabledCheckBox_(new QCheckBox(this)),
       statusValue_(new QLabel(this)),
       detailsValue_(new QLabel(this)),
       frameInfoValue_(new QLabel(this)),
@@ -64,6 +66,8 @@ ConnectionWindow::ConnectionWindow(QWidget* parent)
       receivedFrameBytes_(0),
       screenGeneration_(0),
       droppedDecodeFrames_(0),
+      lastRemoteX_(0),
+      lastRemoteY_(0),
       reconnectAttempt_(0),
       reconnecting_(false),
       connectedSession_(false),
@@ -109,6 +113,31 @@ ConnectionWindow::ConnectionWindow(QWidget* parent)
     detailsValue_->setWordWrap(true);
     detailsValue_->setTextInteractionFlags(Qt::TextSelectableByMouse);
     frameInfoValue_->setText("No remote frame received.");
+    inputEnabledCheckBox_->setText("Enable remote keyboard and mouse input");
+    inputEnabledCheckBox_->setChecked(true);
+    inputEnabledCheckBox_->setToolTip(
+        "Turn this off to view the remote screen without controlling it."
+    );
+    screenWidget_->setToolTip(
+        "Click the remote screen to capture keyboard input."
+    );
+    screenWidget_->setMouseEventHandler(
+        [this](int action, int button, int x, int y) {
+            if (inputEnabledCheckBox_->isChecked()) {
+                sendRemoteMouseEvent(action, button, x, y);
+            }
+        }
+    );
+    screenWidget_->setKeyEventHandler(
+        [this](int status, const QString& key) {
+            if (inputEnabledCheckBox_->isChecked()) {
+                sendRemoteKeyEvent(status, key);
+            }
+        }
+    );
+    screenWidget_->setReleaseInputHandler([this]() {
+        releaseRemoteInputs();
+    });
 
     connectButton_->setDefault(true);
     connectButton_->setMinimumHeight(36);
@@ -126,6 +155,7 @@ ConnectionWindow::ConnectionWindow(QWidget* parent)
     layout->addWidget(statusValue_);
     layout->addWidget(detailsValue_);
     layout->addWidget(frameInfoValue_);
+    layout->addWidget(inputEnabledCheckBox_);
     layout->addWidget(screenWidget_, 1);
 
     heartbeatTimer_->setInterval(HEARTBEAT_POLL_MS);
@@ -141,6 +171,17 @@ ConnectionWindow::ConnectionWindow(QWidget* parent)
         reconnectAttempt_ = 0;
         startConnect(false);
     });
+    connect(
+        inputEnabledCheckBox_,
+        &QCheckBox::toggled,
+        this,
+        [this](bool enabled) {
+            if (!enabled) {
+                releaseRemoteInputs();
+                screenWidget_->clearFocus();
+            }
+        }
+    );
     connect(socket_, &QTcpSocket::connected, this, [this]() {
         handleConnected();
     });
@@ -199,6 +240,7 @@ void ConnectionWindow::closeEvent(QCloseEvent* event)
     manualDisconnect_ = true;
     reconnectTimer_->stop();
     heartbeatTimer_->stop();
+    releaseRemoteInputs();
     socket_->abort();
     event->accept();
 }
@@ -249,6 +291,7 @@ void ConnectionWindow::stopConnection()
     manualDisconnect_ = true;
     reconnectTimer_->stop();
     heartbeatTimer_->stop();
+    releaseRemoteInputs();
     socket_->abort();
     handleDisconnected();
 }
@@ -264,6 +307,8 @@ void ConnectionWindow::handleConnected()
     connectedSession_ = true;
     disconnectHandled_ = false;
     lastFailure_.clear();
+
+    socket_->setSocketOption(QAbstractSocket::LowDelayOption, 1);
 
     if (!sendHello()) {
         lastFailure_ = socket_->errorString();
@@ -294,6 +339,8 @@ void ConnectionWindow::handleDisconnected()
 
     const bool shouldReconnect = connectedSession_ || reconnecting_;
     connectedSession_ = false;
+    pressedMouseButtons_.clear();
+    pressedKeys_.clear();
 
     if (manualDisconnect_) {
         manualDisconnect_ = false;
@@ -562,7 +609,10 @@ void ConnectionWindow::handleFrameDecoded()
         if (!image.isNull()) {
             screenWidget_->setFrame(image);
             frameInfoValue_->setText(
-                QString("Frame %1 | %2 x %3 | %4 KiB | dropped %5")
+                QString(
+                    "Frame %1 | %2 x %3 | %4 KiB | dropped %5 | "
+                    "click screen to control"
+                )
                     .arg(decodingFrame_.frameId)
                     .arg(decodingFrame_.width)
                     .arg(decodingFrame_.height)
@@ -595,6 +645,97 @@ void ConnectionWindow::resetScreenPipeline(const QString& message)
     droppedDecodeFrames_ = 0;
     frameInfoValue_->setText("No remote frame received.");
     screenWidget_->clearFrame(message);
+}
+
+void ConnectionWindow::sendRemoteMouseEvent(
+    int action,
+    int button,
+    int x,
+    int y
+)
+{
+    if (socket_->state() != QAbstractSocket::ConnectedState) {
+        return;
+    }
+
+    MouseEvent event = {};
+    event.action = action;
+    event.button = button;
+    event.x = x;
+    event.y = y;
+
+    Packet packet = {};
+    packet.magic = PACKET_MAGIC;
+    packet.cmd = CMD_MOUSE_EVENT;
+    packet.body_len = sizeof(event);
+    std::memcpy(packet.data, &event, sizeof(event));
+
+    if (sendPacket(packet)) {
+        lastRemoteX_ = x;
+        lastRemoteY_ = y;
+        if (action == MOUSE_ACTION_DOWN) {
+            pressedMouseButtons_.insert(button);
+        } else if (action == MOUSE_ACTION_UP) {
+            pressedMouseButtons_.remove(button);
+        }
+    }
+}
+
+void ConnectionWindow::sendRemoteKeyEvent(
+    int status,
+    const QString& key
+)
+{
+    if (socket_->state() != QAbstractSocket::ConnectedState) {
+        return;
+    }
+
+    const QByteArray keyBytes = key.toLatin1();
+    if (keyBytes.isEmpty()
+        || keyBytes.size() >= static_cast<int>(sizeof(KeyEvent::key))) {
+        return;
+    }
+
+    KeyEvent event = {};
+    event.key_status = status;
+    std::memcpy(event.key, keyBytes.constData(), keyBytes.size());
+
+    Packet packet = {};
+    packet.magic = PACKET_MAGIC;
+    packet.cmd = CMD_KEY_EVENT;
+    packet.body_len = sizeof(event);
+    std::memcpy(packet.data, &event, sizeof(event));
+
+    if (sendPacket(packet)) {
+        if (status == KEY_STATUS_DOWN) {
+            pressedKeys_.insert(key);
+        } else if (status == KEY_STATUS_UP) {
+            pressedKeys_.remove(key);
+        }
+    }
+}
+
+void ConnectionWindow::releaseRemoteInputs()
+{
+    if (socket_->state() == QAbstractSocket::ConnectedState) {
+        const QSet<int> buttons = pressedMouseButtons_;
+        const QSet<QString> keys = pressedKeys_;
+
+        for (int button : buttons) {
+            sendRemoteMouseEvent(
+                MOUSE_ACTION_UP,
+                button,
+                lastRemoteX_,
+                lastRemoteY_
+            );
+        }
+        for (const QString& key : keys) {
+            sendRemoteKeyEvent(KEY_STATUS_UP, key);
+        }
+    }
+
+    pressedMouseButtons_.clear();
+    pressedKeys_.clear();
 }
 
 void ConnectionWindow::pollHeartbeat()
@@ -660,6 +801,9 @@ void ConnectionWindow::updateControls()
 
     hostEdit_->setEnabled(!socketActive);
     portSpin_->setEnabled(!socketActive);
+    inputEnabledCheckBox_->setEnabled(
+        socket_->state() == QAbstractSocket::ConnectedState
+    );
 
     if (socket_->state() == QAbstractSocket::ConnectedState) {
         connectButton_->setText("Disconnect");
