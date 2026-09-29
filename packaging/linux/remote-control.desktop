@@ -1,0 +1,7 @@
+[Desktop Entry]
+Type=Application
+Name=远程控制
+Comment=控制其他设备或允许其他设备远程控制
+Exec=/usr/bin/remote-control
+Terminal=false
+Categories=Network;RemoteAccess;

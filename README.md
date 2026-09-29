@@ -1,15 +1,15 @@
 # Remote Control：Windows/Linux 跨平台远程控制实践
 
-这是一个使用 C++、TCP、Win32 和 X11 实现的跨平台远程控制项目。Windows 和 Linux 都可以作为被控端（server）或控制端（client），四种端到端代码路径共用同一套协议：
+这是一个使用 C++、Qt 6、TCP、Win32 和 X11 实现的跨平台远程控制项目。Windows 和 Linux 使用同一套中文 Qt 界面，每台设备启动一个 `remote_control` 程序后，既可以控制其他设备，也会在后台自动启动本机被控服务。四种端到端路径共用同一套协议：
 
 | 被控端 | 控制端 | 屏幕传输路径 |
 | --- | --- | --- |
-| Windows server | Windows client | GDI 截屏 → JPEG → Win32 显示 |
-| Windows server | Linux client | GDI 截屏 → JPEG → X11 显示 |
-| Linux server | Windows client | XShm 截屏 → JPEG → Win32 显示 |
-| Linux server | Linux client | XShm 截屏 → JPEG → X11 显示 |
+| Windows server | Windows Qt | GDI 截屏 → JPEG → Qt 显示 |
+| Windows server | Linux Qt | GDI 截屏 → JPEG → Qt 显示 |
+| Linux server | Windows Qt | XShm 截屏 → JPEG → Qt 显示 |
+| Linux server | Linux Qt | XShm 截屏 → JPEG → Qt 显示 |
 
-当前版本已经完成四端 JPEG 编解码、客户端本地等比例缩放、黑边鼠标坐标映射和全目标编译。最新四端实现仍建议在目标机器上重新进行 GUI、局域网和 cpolar 联调。
+当前版本已经完成四端 JPEG 编解码、客户端本地等比例缩放、黑边鼠标坐标映射、键鼠控制、中文 Qt 统一界面和服务端自动启动。Windows 与 Ubuntu 22.04 已完成全目标编译和四种 TCP 组合握手验证。
 
 > 本项目没有身份认证、加密或公网安全防护，不应直接作为生产环境远程控制工具使用。
 
@@ -28,8 +28,11 @@ remote_control/
 │   ├── server.cpp            # Windows 被控端
 │   └── client.cpp            # Windows 控制端
 ├── linux/
+│   ├── CMakeLists.txt
 │   ├── server.cpp            # Linux 被控端
 │   └── client.cpp            # Linux 控制端
+├── qt_app/                    # Windows/Linux 共用中文主界面
+├── qt_server/                 # 自动服务管理与日志界面
 ├── LICENSE
 └── README.md
 ```
@@ -50,6 +53,10 @@ remote_control/
 - 基于实际画面区域的鼠标坐标映射
 - 鼠标移动、点击、按下、抬起、双击和滚轮事件
 - 键盘按下和抬起事件
+- Windows/Linux 共用中文 Qt 界面
+- 单程序同时提供控制端和被控端功能
+- 启动界面时自动启动平台服务，无需手动运行 server
+- 原始 TCP 连接强制直连，不受系统 HTTP 代理影响
 - 断线后返回连接界面并允许重新连接
 - 屏幕帧单槽位更新，避免应用层无限积累历史帧
 
@@ -278,24 +285,27 @@ windows/build/win_server.exe
 windows/build/win_client.exe
 ```
 
-可选的 Qt 连接端界面使用 Qt 6 的 Widgets 和 Network 模块。通过 Qt 自带的 CMake 包装器构建，可以避免把某个开发者本机的 Qt 安装路径写入项目：
+统一 Qt 程序使用 Qt 6 的 Widgets、Network 和 Concurrent 模块：
 
 ```powershell
-D:\Qt\6.11.2\mingw_64\bin\qt-cmake.bat `
-    -S windows -B build/qt-client -G Ninja `
-    -DBUILD_QT_CLIENT=ON
+D:\Qt\Tools\CMake_64\bin\cmake.exe `
+    -S windows -B build/qt-windows -G Ninja `
+    -DCMAKE_PREFIX_PATH=D:\Qt\6.11.2\mingw_64 `
+    -DCMAKE_C_COMPILER=D:\Qt\Tools\mingw1310_64\bin\gcc.exe `
+    -DCMAKE_CXX_COMPILER=D:\Qt\Tools\mingw1310_64\bin\g++.exe `
+    -DBUILD_QT_APP=ON
 
 D:\Qt\Tools\CMake_64\bin\cmake.exe `
-    --build build/qt-client --target qt_client
+    --build build/qt-windows --target remote_control win_server
 ```
 
-当前 `qt_client` 支持地址和端口保存、连接状态、协议心跳、断线指数退避重连，以及 JPEG/BGRA32 远程画面显示。完整帧在后台线程解码，界面线程按窗口大小等比例绘制并保留黑边；解码繁忙时只保留最新待处理帧，避免产生延迟队列。键鼠控制仍由 `win_client` 提供，后续会在独立审查步骤中迁移到 Qt。
+生成的 `remote_control.exe` 是用户唯一需要启动的程序。`win_server.exe` 与它放在同一目录，由 Qt 界面自动在后台启动。
 
 也可以从命令行预填地址并立即连接，便于本机联调：
 
 ```powershell
 $env:Path = "D:\Qt\6.11.2\mingw_64\bin;D:\Qt\Tools\mingw1310_64\bin;$env:Path"
-.\build\qt-client\qt_client.exe --host 127.0.0.1 --port 9999 --connect
+.\build\qt-windows\remote_control.exe --host 127.0.0.1 --port 9999 --connect
 ```
 
 ### Linux
@@ -304,69 +314,55 @@ $env:Path = "D:\Qt\6.11.2\mingw_64\bin;D:\Qt\Tools\mingw1310_64\bin;$env:Path"
 
 ```bash
 sudo apt update
-sudo apt install build-essential libx11-dev libxext-dev xdotool
+sudo apt install build-essential cmake ninja-build pkg-config \
+    qt6-base-dev libgl1-mesa-dev libx11-dev libxext-dev xdotool
 ```
 
 编译：
 
 ```bash
-g++ -std=c++17 -Wall -Wextra -Wpedantic \
-    linux/server.cpp -o linux/server \
-    -lX11 -lXext -pthread
+cmake -S linux -B build/qt-linux -G Ninja \
+    -DCMAKE_BUILD_TYPE=Release \
+    -DBUILD_QT_APP=ON
 
-g++ -std=c++17 -Wall -Wextra -Wpedantic \
-    linux/client.cpp -o linux/client \
-    -lX11 -pthread
+cmake --build build/qt-linux --target remote_control linux_server
 ```
 
 ## 运行
 
-Windows 和 Linux server 默认监听：
+Windows 和 Linux 的 Qt 程序启动后会自动在后台监听：
 
 ```text
 0.0.0.0:9999
 ```
 
-### Windows server → 任意 client
+### Windows
 
 Windows：
 
 ```powershell
-.\windows\build\win_server.exe
+.\build\qt-windows\remote_control.exe
 ```
 
-Linux client：
+### Linux
 
 ```bash
-./linux/client
+./build/qt-linux/remote_control
 ```
 
-或启动 Windows client：
+程序包含两个中文页签：
 
-```powershell
-.\windows\build\win_client.exe
-```
-
-### Linux server → 任意 client
-
-Linux：
-
-```bash
-./linux/server
-```
-
-然后启动 Windows client 或 Linux client，在连接界面输入 Linux 主机地址和端口。
-
-两个客户端都保留现有连接界面，支持 IPv4、域名和自定义端口。断线后会返回连接界面。
+- `控制其他设备`：输入对方地址和端口，查看画面并发送键鼠操作。
+- `允许远程控制`：查看本机服务状态、服务程序路径和实时日志，也可以停止或重新启动服务。
 
 Linux client 也可以用命令行参数预填连接信息：
 
 ```bash
-./linux/client 192.168.1.10 9999
-./linux/client example.tcp.cpolar.cn 12345
+./build/qt-linux/remote_control --host 192.168.1.10 --port 9999
+./build/qt-linux/remote_control --host example.tcp.cpolar.cn --port 12345 --connect
 ```
 
-参数只用于预填，仍会先显示连接界面。
+Linux 项目当前依赖 X11/XShm 和 xdotool，因此 Qt 程序默认使用 xcb/X11 后端。原生 Wayland 输入注入不在当前支持范围内。
 
 ## server.conf
 

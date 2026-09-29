@@ -1,0 +1,10 @@
+Package: remote-control-qt
+Version: 0.4.0
+Section: net
+Priority: optional
+Architecture: amd64
+Depends: libqt6widgets6, libqt6network6, libqt6concurrent6, libx11-6, libxext6, xdotool
+Maintainer: remote_control project
+Description: Windows and Linux remote control with a Chinese Qt interface
+ A unified Qt application that can control another device and automatically
+ starts the local controlled-host service.
