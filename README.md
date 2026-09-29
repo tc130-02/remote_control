@@ -1,5 +1,7 @@
 # Remote Control：Windows/Linux 跨平台远程控制实践
 
+> 求职项目快速了解：[秋招项目速览](docs/autumn-recruitment-showcase.md)
+
 这是一个使用 C++、Qt 6、TCP、Win32 和 X11 实现的跨平台远程控制项目。Windows 和 Linux 使用同一套中文 Qt 界面，每台设备启动一个 `remote_control` 程序后，既可以控制其他设备，也会在后台自动启动本机被控服务。四种端到端路径共用同一套协议：
 
 | 被控端 | 控制端 | 屏幕传输路径 |
