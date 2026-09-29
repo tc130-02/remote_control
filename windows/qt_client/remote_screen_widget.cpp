@@ -17,7 +17,7 @@
 
 RemoteScreenWidget::RemoteScreenWidget(QWidget* parent)
     : QWidget(parent),
-      message_("Connect to a server to view its screen."),
+      message_(QStringLiteral("连接被控端后将在这里显示远程画面。")),
       hasLastRemotePoint_(false)
 {
     setMinimumSize(480, 270);

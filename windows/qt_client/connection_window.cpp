@@ -14,6 +14,7 @@
 #include <QImage>
 #include <QLabel>
 #include <QLineEdit>
+#include <QNetworkProxy>
 #include <QPushButton>
 #include <QSettings>
 #include <QSpinBox>
@@ -74,52 +75,52 @@ ConnectionWindow::ConnectionWindow(QWidget* parent)
       disconnectHandled_(true),
       manualDisconnect_(false)
 {
-    setWindowTitle("Remote Control - Qt Client");
+    setWindowTitle(QStringLiteral("远程控制 - 控制端"));
     resize(1100, 780);
     setMinimumSize(700, 560);
 
-    auto* title = new QLabel("Remote Control", this);
+    auto* title = new QLabel(QStringLiteral("远程控制控制端"), this);
     QFont titleFont = title->font();
     titleFont.setPointSize(titleFont.pointSize() + 5);
     titleFont.setBold(true);
     title->setFont(titleFont);
 
     auto* subtitle = new QLabel(
-        "Connect to a Windows or Linux remote-control server.",
+        QStringLiteral("连接 Windows 或 Linux 被控端，查看并控制远程桌面。"),
         this
     );
     subtitle->setWordWrap(true);
 
     QSettings settings;
     hostEdit_->setText(settings.value("connection/host", "127.0.0.1").toString());
-    hostEdit_->setPlaceholderText("IP address or hostname");
+    hostEdit_->setPlaceholderText(QStringLiteral("IP 地址或主机名"));
 
     portSpin_->setRange(1, 65535);
     portSpin_->setValue(settings.value("connection/port", 9999).toInt());
 
     auto* form = new QFormLayout;
-    form->addRow("Server address", hostEdit_);
-    form->addRow("Port", portSpin_);
+    form->addRow(QStringLiteral("服务地址"), hostEdit_);
+    form->addRow(QStringLiteral("端口"), portSpin_);
 
     auto* separator = new QFrame(this);
     separator->setFrameShape(QFrame::HLine);
     separator->setFrameShadow(QFrame::Sunken);
 
-    auto* statusCaption = new QLabel("Status", this);
+    auto* statusCaption = new QLabel(QStringLiteral("连接状态"), this);
     QFont statusFont = statusCaption->font();
     statusFont.setBold(true);
     statusCaption->setFont(statusFont);
 
     detailsValue_->setWordWrap(true);
     detailsValue_->setTextInteractionFlags(Qt::TextSelectableByMouse);
-    frameInfoValue_->setText("No remote frame received.");
-    inputEnabledCheckBox_->setText("Enable remote keyboard and mouse input");
+    frameInfoValue_->setText(QStringLiteral("尚未收到远程画面。"));
+    inputEnabledCheckBox_->setText(QStringLiteral("启用远程键盘和鼠标控制"));
     inputEnabledCheckBox_->setChecked(true);
     inputEnabledCheckBox_->setToolTip(
-        "Turn this off to view the remote screen without controlling it."
+        QStringLiteral("关闭后只查看远程画面，不发送键盘和鼠标操作。")
     );
     screenWidget_->setToolTip(
-        "Click the remote screen to capture keyboard input."
+        QStringLiteral("点击远程画面后即可发送键盘操作。")
     );
     screenWidget_->setMouseEventHandler(
         [this](int action, int button, int x, int y) {
@@ -160,6 +161,7 @@ ConnectionWindow::ConnectionWindow(QWidget* parent)
 
     heartbeatTimer_->setInterval(HEARTBEAT_POLL_MS);
     reconnectTimer_->setSingleShot(true);
+    socket_->setProxy(QNetworkProxy::NoProxy);
 
     connect(connectButton_, &QPushButton::clicked, this, [this]() {
         if (socket_->state() != QAbstractSocket::UnconnectedState) {
@@ -209,7 +211,10 @@ ConnectionWindow::ConnectionWindow(QWidget* parent)
         }
     );
 
-    setStatus("Disconnected", "Enter a server address, then select Connect.");
+    setStatus(
+        QStringLiteral("未连接"),
+        QStringLiteral("请输入被控端地址和端口，然后点击连接。")
+    );
     updateControls();
 }
 
@@ -249,7 +254,10 @@ void ConnectionWindow::startConnect(bool reconnectAttempt)
 {
     const QString host = hostEdit_->text().trimmed();
     if (host.isEmpty()) {
-        setStatus("Connection failed", "The server address cannot be empty.");
+        setStatus(
+            QStringLiteral("连接失败"),
+            QStringLiteral("服务地址不能为空。")
+        );
         updateControls();
         return;
     }
@@ -261,7 +269,7 @@ void ConnectionWindow::startConnect(bool reconnectAttempt)
     reconnectTimer_->stop();
     receiveBuffer_.clear();
     lastFailure_.clear();
-    resetScreenPipeline("Waiting for the first remote frame...");
+    resetScreenPipeline(QStringLiteral("正在等待第一帧远程画面……"));
     reconnecting_ = reconnectAttempt;
     connectedSession_ = false;
     disconnectHandled_ = false;
@@ -269,16 +277,16 @@ void ConnectionWindow::startConnect(bool reconnectAttempt)
 
     if (reconnectAttempt) {
         setStatus(
-            "Reconnecting",
-            QString("Attempt %1 to %2:%3")
+            QStringLiteral("正在重新连接"),
+            QStringLiteral("第 %1 次尝试连接 %2:%3")
                 .arg(reconnectAttempt_)
                 .arg(host)
                 .arg(portSpin_->value())
         );
     } else {
         setStatus(
-            "Connecting",
-            QString("Opening %1:%2").arg(host).arg(portSpin_->value())
+            QStringLiteral("正在连接"),
+            QStringLiteral("正在连接 %1:%2").arg(host).arg(portSpin_->value())
         );
     }
 
@@ -311,15 +319,15 @@ void ConnectionWindow::handleConnected()
     socket_->setSocketOption(QAbstractSocket::LowDelayOption, 1);
 
     if (!sendHello()) {
-        lastFailure_ = socket_->errorString();
+        lastFailure_ = socketErrorText();
         socket_->abort();
         handleDisconnected();
         return;
     }
     heartbeatTimer_->start();
     setStatus(
-        "Connected",
-        QString("Connected to %1:%2")
+        QStringLiteral("已连接"),
+        QStringLiteral("已连接到 %1:%2")
             .arg(hostEdit_->text().trimmed())
             .arg(portSpin_->value())
     );
@@ -335,7 +343,7 @@ void ConnectionWindow::handleDisconnected()
     disconnectHandled_ = true;
     heartbeatTimer_->stop();
     receiveBuffer_.clear();
-    resetScreenPipeline("Disconnected from the remote screen.");
+    resetScreenPipeline(QStringLiteral("已断开远程画面。"));
 
     const bool shouldReconnect = connectedSession_ || reconnecting_;
     connectedSession_ = false;
@@ -346,14 +354,19 @@ void ConnectionWindow::handleDisconnected()
         manualDisconnect_ = false;
         reconnecting_ = false;
         reconnectAttempt_ = 0;
-        setStatus("Disconnected", "Connection closed by the user.");
+        setStatus(
+            QStringLiteral("未连接"),
+            QStringLiteral("连接已由用户关闭。")
+        );
     } else if (shouldReconnect) {
         scheduleReconnect();
     } else {
         reconnecting_ = false;
         setStatus(
-            "Connection failed",
-            lastFailure_.isEmpty() ? "The server could not be reached." : lastFailure_
+            QStringLiteral("连接失败"),
+            lastFailure_.isEmpty()
+                ? QStringLiteral("无法连接到被控端。")
+                : lastFailure_
         );
     }
 
@@ -362,11 +375,11 @@ void ConnectionWindow::handleDisconnected()
 
 void ConnectionWindow::handleSocketError()
 {
-    lastFailure_ = socket_->errorString();
+    lastFailure_ = socketErrorText();
     if (socket_->state() == QAbstractSocket::UnconnectedState) {
         handleDisconnected();
     } else {
-        setStatus("Connection problem", lastFailure_);
+        setStatus(QStringLiteral("连接异常"), lastFailure_);
     }
 }
 
@@ -391,7 +404,7 @@ void ConnectionWindow::processReceiveBuffer()
         if (magic != PACKET_MAGIC
             || bodyLength < 0
             || bodyLength > PACKET_DATA_SIZE) {
-            lastFailure_ = "The server sent an invalid protocol packet.";
+            lastFailure_ = QStringLiteral("被控端发送了无效协议数据。");
             socket_->abort();
             handleDisconnected();
             return;
@@ -429,7 +442,7 @@ void ConnectionWindow::handlePacket(const Packet& packet)
     if (packet.cmd == CMD_HEARTBEAT_PING) {
         HeartbeatPayload payload = {};
         if (!readHeartbeatPayload(packet, payload)) {
-            lastFailure_ = "The server sent an invalid heartbeat.";
+            lastFailure_ = QStringLiteral("被控端发送了无效心跳数据。");
             socket_->abort();
             handleDisconnected();
             return;
@@ -438,7 +451,7 @@ void ConnectionWindow::handlePacket(const Packet& packet)
         Packet pong = packet;
         pong.cmd = CMD_HEARTBEAT_PONG;
         if (!sendPacket(pong)) {
-            lastFailure_ = socket_->errorString();
+            lastFailure_ = socketErrorText();
             socket_->abort();
             handleDisconnected();
         }
@@ -448,15 +461,15 @@ void ConnectionWindow::handlePacket(const Packet& packet)
     if (packet.cmd == CMD_HEARTBEAT_PONG) {
         HeartbeatPayload payload = {};
         if (!readHeartbeatPayload(packet, payload)) {
-            lastFailure_ = "The server sent an invalid heartbeat.";
+            lastFailure_ = QStringLiteral("被控端发送了无效心跳数据。");
             socket_->abort();
             handleDisconnected();
             return;
         }
 
         setStatus(
-            "Connected",
-            QString("Heartbeat round trip: %1 ms")
+            QStringLiteral("已连接"),
+            QStringLiteral("心跳往返延迟：%1 毫秒")
                 .arg(heartbeatNowMs() - payload.sent_at_ms)
         );
     }
@@ -609,9 +622,9 @@ void ConnectionWindow::handleFrameDecoded()
         if (!image.isNull()) {
             screenWidget_->setFrame(image);
             frameInfoValue_->setText(
-                QString(
-                    "Frame %1 | %2 x %3 | %4 KiB | dropped %5 | "
-                    "click screen to control"
+                QStringLiteral(
+                    "帧 %1 | %2 × %3 | %4 KiB | 丢弃 %5 | "
+                    "点击画面开始控制"
                 )
                     .arg(decodingFrame_.frameId)
                     .arg(decodingFrame_.width)
@@ -621,7 +634,7 @@ void ConnectionWindow::handleFrameDecoded()
             );
         } else {
             frameInfoValue_->setText(
-                QString("Frame %1 could not be decoded.")
+                QStringLiteral("无法解码第 %1 帧。")
                     .arg(decodingFrame_.frameId)
             );
         }
@@ -643,7 +656,7 @@ void ConnectionWindow::resetScreenPipeline(const QString& message)
     discardReceivingFrame();
     pendingDecodeFrame_ = ScreenFrame();
     droppedDecodeFrames_ = 0;
-    frameInfoValue_->setText("No remote frame received.");
+    frameInfoValue_->setText(QStringLiteral("尚未收到远程画面。"));
     screenWidget_->clearFrame(message);
 }
 
@@ -746,7 +759,7 @@ void ConnectionWindow::pollHeartbeat()
 
     const std::int64_t now = heartbeatNowMs();
     if (now - lastReceiveMs_ >= HEARTBEAT_TIMEOUT_MS) {
-        lastFailure_ = "Heartbeat timed out after 10 seconds.";
+        lastFailure_ = QStringLiteral("连续 10 秒未收到数据，连接超时。");
         socket_->abort();
         handleDisconnected();
         return;
@@ -758,7 +771,7 @@ void ConnectionWindow::pollHeartbeat()
                 CMD_HEARTBEAT_PING,
                 heartbeatSequence_++
             ))) {
-            lastFailure_ = socket_->errorString();
+            lastFailure_ = socketErrorText();
             socket_->abort();
             handleDisconnected();
             return;
@@ -775,8 +788,8 @@ void ConnectionWindow::scheduleReconnect()
     const int delaySeconds = reconnectDelaySeconds(reconnectAttempt_);
 
     setStatus(
-        "Waiting to reconnect",
-        QString("Attempt %1 starts in %2 second(s). %3")
+        QStringLiteral("等待重新连接"),
+        QStringLiteral("第 %1 次重连将在 %2 秒后开始。%3")
             .arg(reconnectAttempt_)
             .arg(delaySeconds)
             .arg(lastFailure_)
@@ -806,13 +819,55 @@ void ConnectionWindow::updateControls()
     );
 
     if (socket_->state() == QAbstractSocket::ConnectedState) {
-        connectButton_->setText("Disconnect");
+        connectButton_->setText(QStringLiteral("断开连接"));
     } else if (socketActive) {
-        connectButton_->setText("Cancel");
+        connectButton_->setText(QStringLiteral("取消连接"));
     } else if (reconnectTimer_->isActive()) {
-        connectButton_->setText("Connect now");
+        connectButton_->setText(QStringLiteral("立即重连"));
     } else {
-        connectButton_->setText("Connect");
+        connectButton_->setText(QStringLiteral("连接"));
+    }
+}
+
+QString ConnectionWindow::socketErrorText() const
+{
+    switch (socket_->error()) {
+    case QAbstractSocket::ConnectionRefusedError:
+        return QStringLiteral("连接被拒绝，请确认被控端已经启动。");
+    case QAbstractSocket::RemoteHostClosedError:
+        return QStringLiteral("被控端已关闭连接。");
+    case QAbstractSocket::HostNotFoundError:
+        return QStringLiteral("无法解析服务地址。");
+    case QAbstractSocket::SocketAccessError:
+        return QStringLiteral("没有访问网络的权限。");
+    case QAbstractSocket::SocketResourceError:
+        return QStringLiteral("系统网络资源不足。");
+    case QAbstractSocket::SocketTimeoutError:
+        return QStringLiteral("连接被控端超时。");
+    case QAbstractSocket::NetworkError:
+        return QStringLiteral("网络连接发生错误。");
+    case QAbstractSocket::AddressInUseError:
+        return QStringLiteral("本地网络地址已被占用。");
+    case QAbstractSocket::SocketAddressNotAvailableError:
+        return QStringLiteral("指定的网络地址不可用。");
+    case QAbstractSocket::UnsupportedSocketOperationError:
+        return QStringLiteral("当前系统不支持此网络操作。");
+    case QAbstractSocket::ProxyAuthenticationRequiredError:
+        return QStringLiteral("代理服务器需要身份验证。");
+    case QAbstractSocket::ProxyConnectionRefusedError:
+        return QStringLiteral("代理服务器拒绝连接。");
+    case QAbstractSocket::ProxyConnectionClosedError:
+        return QStringLiteral("代理服务器已关闭连接。");
+    case QAbstractSocket::ProxyConnectionTimeoutError:
+        return QStringLiteral("连接代理服务器超时。");
+    case QAbstractSocket::ProxyNotFoundError:
+        return QStringLiteral("无法找到代理服务器。");
+    case QAbstractSocket::ProxyProtocolError:
+        return QStringLiteral("代理服务器返回了无效数据。");
+    case QAbstractSocket::OperationError:
+        return QStringLiteral("网络操作状态无效。");
+    default:
+        return QStringLiteral("发生未知网络错误。");
     }
 }
 
@@ -833,6 +888,6 @@ bool ConnectionWindow::sendHello()
 {
     return sendPacket(buildTextPacket(
         CMD_HELLO,
-        "hello qt windows client"
+        "hello qt client"
     ));
 }

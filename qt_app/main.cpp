@@ -1,3 +1,5 @@
+#include "main_window.h"
+
 #include "connection_window.h"
 
 #include <QApplication>
@@ -16,10 +18,10 @@ int main(int argc, char* argv[])
 #endif
     QApplication app(argc, argv);
     QCoreApplication::setOrganizationName("RemoteControl");
-    QCoreApplication::setApplicationName("QtClient");
+    QCoreApplication::setApplicationName("RemoteControl");
 
     QCommandLineParser parser;
-    parser.setApplicationDescription(QStringLiteral("Qt 远程控制客户端"));
+    parser.setApplicationDescription(QStringLiteral("Windows/Linux 远程控制"));
     parser.addHelpOption();
     parser.addOption(QCommandLineOption(
         "host",
@@ -38,18 +40,18 @@ int main(int argc, char* argv[])
     ));
     parser.process(app);
 
-    ConnectionWindow window;
+    MainWindow window;
     bool portValid = false;
     const int port = parser.value("port").toInt(&portValid);
-    window.setServerAddress(
+    window.controller()->setServerAddress(
         parser.value("host"),
         portValid ? port : 9999
     );
     window.show();
 
     if (parser.isSet("connect")) {
-        QTimer::singleShot(0, &window, [&window]() {
-            window.connectToServer();
+        QTimer::singleShot(0, window.controller(), [&window]() {
+            window.controller()->connectToServer();
         });
     }
 

@@ -71,6 +71,7 @@ private:
     void scheduleReconnect();
     void setStatus(const QString& status, const QString& details);
     void updateControls();
+    QString socketErrorText() const;
     bool sendPacket(const Packet& packet);
     bool sendHello();
 
