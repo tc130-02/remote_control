@@ -1,12 +1,14 @@
 #pragma once
 
 #include <QByteArray>
+#include <QSet>
 #include <QWidget>
 
 #include <cstdint>
 
 class QLabel;
 class QLineEdit;
+class QCheckBox;
 class QPushButton;
 class QSpinBox;
 class QString;
@@ -62,6 +64,9 @@ private:
     void startFrameDecode(ScreenFrame frame);
     void handleFrameDecoded();
     void resetScreenPipeline(const QString& message);
+    void sendRemoteMouseEvent(int action, int button, int x, int y);
+    void sendRemoteKeyEvent(int status, const QString& key);
+    void releaseRemoteInputs();
     void pollHeartbeat();
     void scheduleReconnect();
     void setStatus(const QString& status, const QString& details);
@@ -72,6 +77,7 @@ private:
     QLineEdit* hostEdit_;
     QSpinBox* portSpin_;
     QPushButton* connectButton_;
+    QCheckBox* inputEnabledCheckBox_;
     QLabel* statusValue_;
     QLabel* detailsValue_;
     QLabel* frameInfoValue_;
@@ -91,6 +97,10 @@ private:
     int receivedFrameBytes_;
     int screenGeneration_;
     int droppedDecodeFrames_;
+    int lastRemoteX_;
+    int lastRemoteY_;
+    QSet<int> pressedMouseButtons_;
+    QSet<QString> pressedKeys_;
     int reconnectAttempt_;
     bool reconnecting_;
     bool connectedSession_;
