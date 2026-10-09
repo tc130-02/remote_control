@@ -1,26 +1,67 @@
 # Remote Control：Windows/Linux 跨平台远程控制实践
 
-> 求职项目快速了解：[秋招项目速览](docs/autumn-recruitment-showcase.md)
+使用 **C++17、Qt 6、TCP、Win32/GDI 和 X11/XShm** 实现的跨平台远程控制项目。Windows 与 Linux 共用一套中文 Qt 界面和通信协议，每台设备启动一个 `remote_control` 程序后，既可以控制其他设备，也会自动运行本机被控服务。
 
-这是一个使用 C++、Qt 6、TCP、Win32 和 X11 实现的跨平台远程控制项目。Windows 和 Linux 使用同一套中文 Qt 界面，每台设备启动一个 `remote_control` 程序后，既可以控制其他设备，也会在后台自动启动本机被控服务。四种端到端路径共用同一套协议：
+> 项目用于学习和展示跨平台网络、桌面采集、图像传输、远程输入与 GUI 并发协作。当前没有身份认证和传输加密，请勿直接用于生产公网环境。
 
-| 被控端 | 控制端 | 屏幕传输路径 |
+[项目亮点](#项目亮点) · [验证范围](#验证范围) · [协议设计](#屏幕传输协议) · [编译运行](#编译) · [秋招项目速览](docs/autumn-recruitment-showcase.md) · [修改日志](CHANGELOG.md)
+
+## 项目亮点
+
+- **跨平台双端能力**：Windows/Linux 均可作为控制端和被控端，四种组合共用协议与 Qt 控制界面。
+- **统一中文 Qt 应用**：一个程序包含“控制其他设备”和“允许远程控制”两个页面，并通过 `QProcess` 自动管理原生服务端。
+- **完整屏幕链路**：GDI 或 X11/XShm 截屏，经 JPEG 内存压缩、分片传输、完整性校验、后台解码后使用 `QImage/QPainter` 显示。
+- **远程键鼠控制**：支持移动、按下、抬起、双击、滚轮和常用键盘按键，按实际画面区域完成黑边坐标映射。
+- **连接可靠性**：支持双向心跳、10 秒失活检测、指数退避重连、服务端重复接入和会话资源清理。
+- **实时性处理**：使用单槽位最新帧覆盖，避免已经接收完成但尚未解码的历史画面持续堆积。
+- **工程化交付**：提供 Windows x64 便携包和 Ubuntu 22.04 amd64 安装包构建流程，并保留分阶段测试记录。
+
+## 验证范围
+
+| 控制端 | 被控端 | 已验证内容 |
 | --- | --- | --- |
-| Windows server | Windows Qt | GDI 截屏 → JPEG → Qt 显示 |
-| Windows server | Linux Qt | GDI 截屏 → JPEG → Qt 显示 |
-| Linux server | Windows Qt | XShm 截屏 → JPEG → Qt 显示 |
-| Linux server | Linux Qt | XShm 截屏 → JPEG → Qt 显示 |
+| Windows Qt | Windows server | 公网双机连接、心跳、远程画面与键鼠控制 |
+| Windows Qt | Linux server | TCP 协议握手与心跳，往返约 1 ms |
+| Linux Qt | Windows server | TCP 会话建立 |
+| Linux Qt | Linux server | TCP 会话建立 |
 
-当前版本已经完成四端 JPEG 编解码、客户端本地等比例缩放、黑边鼠标坐标映射、键鼠控制、中文 Qt 统一界面和服务端自动启动。Windows 与 Ubuntu 22.04 已完成全目标编译和四种 TCP 组合握手验证。
+- Windows 统一应用已验证自动启动 `win_server.exe` 并监听 `0.0.0.0:9999`。
+- Ubuntu 安装包已验证自动启动 `/opt/remote-control/linux_server` 并监听 `0.0.0.0:9999`。
+- Linux 实体机上的 X11 画面、键鼠控制和不同桌面环境兼容性仍需继续验收。
+- 原生 Wayland 输入注入不在当前支持范围内。
 
-> 本项目没有身份认证、加密或公网安全防护，不应直接作为生产环境远程控制工具使用。
+## 技术架构
+
+```mermaid
+flowchart LR
+    A[Qt 控制端] -->|TCP 自定义协议| B[Windows / Linux 被控端]
+    B --> C[屏幕采集<br/>GDI 或 X11/XShm]
+    C --> D[JPEG 内存压缩]
+    D --> E[BEGIN / CHUNK / END 分片]
+    E --> A
+    A --> F[QtConcurrent 后台解码]
+    F --> G[QImage / QPainter 显示]
+    G --> H[键盘鼠标事件]
+    H -->|TCP| B
+    B --> I[SendInput 或 xdotool]
+```
+
+```text
+remote_control
+├── 控制其他设备：QTcpSocket + 画面重组 + 后台解码 + 键鼠采集
+└── 允许远程控制：QProcess 自动管理平台原生服务端
+    ├── Windows：win_server.exe
+    └── Linux：linux_server
+```
 
 ## 项目结构
 
 ```text
 remote_control/
 ├── common/
-│   └── packet.h              # 四端共享的协议、命令和固定宽度结构
+│   ├── packet.h              # 协议、命令和固定宽度结构
+│   ├── heartbeat.h           # 心跳负载与超时参数
+│   └── reconnect.h           # 指数退避计算
 ├── third_party/
 │   ├── stb_image.h           # JPEG 内存解码
 │   ├── stb_image_write.h     # JPEG 内存编码
@@ -28,39 +69,43 @@ remote_control/
 ├── windows/
 │   ├── CMakeLists.txt
 │   ├── server.cpp            # Windows 被控端
-│   └── client.cpp            # Windows 控制端
+│   ├── client.cpp            # 原生 Win32 控制端
+│   └── qt_client/            # Qt 连接、画面与键鼠控制
 ├── linux/
 │   ├── CMakeLists.txt
 │   ├── server.cpp            # Linux 被控端
-│   └── client.cpp            # Linux 控制端
+│   └── client.cpp            # 原生 X11 控制端
 ├── qt_app/                    # Windows/Linux 共用中文主界面
 ├── qt_server/                 # 自动服务管理与日志界面
+├── packaging/                 # Ubuntu/Debian 安装包配置
+├── docs/                      # 分阶段设计与验证记录
+├── CHANGELOG.md
 ├── LICENSE
 └── README.md
 ```
 
 ## 核心功能
 
-- WinSock/POSIX Socket TCP 通信
-- IPv4、域名和自定义端口连接
-- `getaddrinfo()` 地址解析
-- TCP `sendall`、粘包和半包解析
-- Windows GDI 原始桌面分辨率截屏
-- Linux X11/XShm 原始桌面分辨率截屏
-- quality 75 的 JPEG 内存编码和解码
-- 约 64KB 的屏幕数据分片
-- BGRA32 旧格式接收兼容
-- Windows/Linux 客户端自由调整窗口大小
-- 居中等比例缩放和黑色留边
-- 基于实际画面区域的鼠标坐标映射
-- 鼠标移动、点击、按下、抬起、双击和滚轮事件
-- 键盘按下和抬起事件
-- Windows/Linux 共用中文 Qt 界面
-- 单程序同时提供控制端和被控端功能
-- 启动界面时自动启动平台服务，无需手动运行 server
-- 原始 TCP 连接强制直连，不受系统 HTTP 代理影响
-- 断线后返回连接界面并允许重新连接
-- 屏幕帧单槽位更新，避免应用层无限积累历史帧
+**网络与协议**
+
+- WinSock/POSIX Socket TCP 通信，支持 IPv4、域名和自定义端口。
+- 固定包头与增量缓冲区处理粘包、半包和连续多包。
+- 约 64 KB 屏幕分片，支持 JPEG 与旧 BGRA32 格式。
+- Qt 原始 TCP 连接强制直连，不受系统 HTTP 代理影响。
+
+**画面与输入**
+
+- Windows GDI、Linux X11/XShm 原始桌面分辨率截屏。
+- quality 75 JPEG 内存编解码，不产生临时图片文件。
+- 居中等比例缩放、黑色留边和实际画面区域坐标映射。
+- 鼠标移动、按下、抬起、双击、滚轮及键盘按下/抬起。
+
+**Qt 与连接管理**
+
+- Windows/Linux 共用中文 Qt 界面，单程序同时提供控制端与被控端入口。
+- 启动界面时自动运行平台服务，无需用户手动启动 server。
+- 双向心跳、超时断开、指数退避重连与服务端重复接入。
+- 后台 JPEG 解码和单槽位最新帧更新，保持 GUI 响应。
 
 服务端始终捕获并发送远程桌面的原始宽高。窗口缩放只发生在客户端显示阶段，不会要求服务端降低分辨率。
 
@@ -366,18 +411,20 @@ Linux client 也可以用命令行参数预填连接信息：
 
 Linux 项目当前依赖 X11/XShm 和 xdotool，因此 Qt 程序默认使用 xcb/X11 后端。原生 Wayland 输入注入不在当前支持范围内。
 
-## server.conf
+## 连接配置
 
-客户端会从可执行文件所在目录读取并保存服务器地址。
+Qt 控制端使用 `QSettings` 保存最近一次服务地址和端口，重新启动应用后自动恢复。
 
-Windows client 使用两行格式：
+原生客户端继续从可执行文件所在目录读取 `server.conf`。
+
+Windows 原生 client 使用两行格式：
 
 ```text
 192.168.1.10
 9999
 ```
 
-Linux client 使用键值格式：
+Linux 原生 client 使用键值格式：
 
 ```text
 ip=192.168.1.10
@@ -405,7 +452,7 @@ cpolar tcp 9999
 - Linux 输入模拟依赖 `xdotool`，主要面向 X11；不支持原生 Wayland 输入控制。
 - Windows server 当前使用主桌面 GDI 捕获逻辑，不包含专门的多显示器布局管理。
 - 项目按单客户端连接流程设计。
-- 最新四端 JPEG、自由缩放和重连流程已经通过编译，但仍需实际 GUI 和网络回归测试。
+- 四种 Qt/TCP 组合已经完成构建与握手验证；Linux 实体机画面和键鼠仍需继续回归。
 
 ## 说明
 
