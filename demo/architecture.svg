@@ -1,0 +1,104 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="900" viewBox="0 0 1600 900">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#071426"/>
+      <stop offset="1" stop-color="#102b46"/>
+    </linearGradient>
+    <linearGradient id="blue" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#2563eb"/>
+      <stop offset="1" stop-color="#0ea5e9"/>
+    </linearGradient>
+    <linearGradient id="green" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#059669"/>
+      <stop offset="1" stop-color="#22c55e"/>
+    </linearGradient>
+    <filter id="shadow" x="-20%" y="-20%" width="140%" height="140%">
+      <feDropShadow dx="0" dy="12" stdDeviation="14" flood-color="#000" flood-opacity="0.28"/>
+    </filter>
+    <marker id="arrowBlue" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto">
+      <path d="M0,0 L12,6 L0,12 Z" fill="#38bdf8"/>
+    </marker>
+    <marker id="arrowGreen" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto">
+      <path d="M0,0 L12,6 L0,12 Z" fill="#4ade80"/>
+    </marker>
+    <style>
+      .title { font: 700 42px "Microsoft YaHei", "Noto Sans CJK SC", sans-serif; fill: #f8fafc; }
+      .subtitle { font: 400 21px "Microsoft YaHei", "Noto Sans CJK SC", sans-serif; fill: #9fb4ca; }
+      .box-title { font: 700 27px "Microsoft YaHei", "Noto Sans CJK SC", sans-serif; fill: #fff; }
+      .body { font: 400 20px "Microsoft YaHei", "Noto Sans CJK SC", sans-serif; fill: #d8e5f2; }
+      .small { font: 400 17px "Microsoft YaHei", "Noto Sans CJK SC", sans-serif; fill: #b9c9d9; }
+      .tag { font: 700 18px "Consolas", "Microsoft YaHei", monospace; fill: #071426; }
+      .flow { font: 600 18px "Microsoft YaHei", "Noto Sans CJK SC", sans-serif; }
+    </style>
+  </defs>
+
+  <rect width="1600" height="900" fill="url(#bg)"/>
+  <circle cx="1480" cy="90" r="230" fill="#1d4ed8" opacity="0.11"/>
+  <circle cx="80" cy="830" r="260" fill="#10b981" opacity="0.08"/>
+
+  <text x="80" y="78" class="title">跨平台远程桌面：数据与控制闭环</text>
+  <text x="80" y="116" class="subtitle">C++17 · Windows GDI · Linux X11/XShm · TCP · JPEG · Qt</text>
+
+  <g filter="url(#shadow)">
+    <rect x="70" y="190" width="390" height="400" rx="28" fill="#0d2035" stroke="#38bdf8" stroke-width="2"/>
+    <rect x="70" y="190" width="390" height="76" rx="28" fill="url(#blue)"/>
+    <rect x="70" y="238" width="390" height="28" fill="url(#blue)"/>
+    <text x="105" y="239" class="box-title">控制端 Client</text>
+
+    <rect x="605" y="190" width="390" height="400" rx="28" fill="#0d2035" stroke="#a78bfa" stroke-width="2"/>
+    <rect x="605" y="190" width="390" height="76" rx="28" fill="#6d28d9"/>
+    <rect x="605" y="238" width="390" height="28" fill="#6d28d9"/>
+    <text x="640" y="239" class="box-title">共享 TCP 协议</text>
+
+    <rect x="1140" y="190" width="390" height="400" rx="28" fill="#0d2035" stroke="#4ade80" stroke-width="2"/>
+    <rect x="1140" y="190" width="390" height="76" rx="28" fill="url(#green)"/>
+    <rect x="1140" y="238" width="390" height="28" fill="url(#green)"/>
+    <text x="1175" y="239" class="box-title">被控端 Server</text>
+  </g>
+
+  <text x="105" y="316" class="body">• BEGIN / CHUNK / END 组帧</text>
+  <text x="105" y="360" class="body">• 后台 JPEG 解码</text>
+  <text x="105" y="404" class="body">• 只保留最新待处理帧</text>
+  <text x="105" y="448" class="body">• 等比例绘制与黑边映射</text>
+  <text x="105" y="492" class="body">• 键鼠状态跟踪与释放</text>
+  <rect x="104" y="530" width="193" height="36" rx="18" fill="#38bdf8"/>
+  <text x="125" y="555" class="tag">Qt / Win32 / X11</text>
+
+  <text x="640" y="316" class="body">固定 12 字节包头</text>
+  <text x="640" y="354" class="small">magic · command · body length</text>
+  <line x1="640" y1="383" x2="960" y2="383" stroke="#5b7088"/>
+  <text x="640" y="422" class="body">画面块约 64 KiB</text>
+  <text x="640" y="460" class="small">frame id · offset · data length</text>
+  <line x1="640" y1="489" x2="960" y2="489" stroke="#5b7088"/>
+  <text x="640" y="528" class="body">心跳 + 指数退避重连</text>
+  <text x="640" y="562" class="small">3s idle · 10s timeout · 1/2/4/8s</text>
+
+  <text x="1175" y="316" class="body">• 捕获原始桌面</text>
+  <text x="1175" y="360" class="body">• 内存编码 JPEG（质量 75）</text>
+  <text x="1175" y="404" class="body">• 分块发送完整帧</text>
+  <text x="1175" y="448" class="body">• 注入鼠标与键盘事件</text>
+  <text x="1175" y="492" class="body">• 断开后继续接受连接</text>
+  <rect x="1174" y="530" width="220" height="36" rx="18" fill="#4ade80"/>
+  <text x="1195" y="555" class="tag">GDI / X11 + XShm</text>
+
+  <path d="M1125 335 C1080 335 1050 335 1010 335" fill="none" stroke="#38bdf8" stroke-width="5" marker-end="url(#arrowBlue)"/>
+  <path d="M590 335 C545 335 515 335 475 335" fill="none" stroke="#38bdf8" stroke-width="5" marker-end="url(#arrowBlue)"/>
+  <text x="493" y="311" class="flow" fill="#7dd3fc">JPEG 画面帧</text>
+  <text x="1026" y="311" class="flow" fill="#7dd3fc">画面分块</text>
+
+  <path d="M475 472 C515 472 545 472 590 472" fill="none" stroke="#4ade80" stroke-width="5" marker-end="url(#arrowGreen)"/>
+  <path d="M1010 472 C1050 472 1080 472 1125 472" fill="none" stroke="#4ade80" stroke-width="5" marker-end="url(#arrowGreen)"/>
+  <text x="493" y="507" class="flow" fill="#86efac">键盘 / 鼠标</text>
+  <text x="1027" y="507" class="flow" fill="#86efac">输入事件</text>
+
+  <g filter="url(#shadow)">
+    <rect x="70" y="665" width="1460" height="150" rx="24" fill="#0b1c2e" stroke="#314a62"/>
+  </g>
+  <text x="105" y="712" class="box-title">设计取舍</text>
+  <text x="105" y="756" class="body">优先保证完整工程闭环与低积压延迟</text>
+  <text x="105" y="790" class="small">旧帧可丢弃；输入必须及时；连接必须可检测和恢复</text>
+  <line x1="720" y1="700" x2="720" y2="785" stroke="#314a62" stroke-width="2"/>
+  <text x="765" y="712" class="box-title">当前边界</text>
+  <text x="765" y="756" class="body">未加入认证 / 加密 / 视频编码 / 多显示器</text>
+  <text x="765" y="790" class="small">它是可运行的工程原型，不把它包装成生产级产品</text>
+</svg>

@@ -327,6 +327,14 @@ Windows 和 Linux server 默认监听：
 0.0.0.0:9999
 ```
 
+### 第二台 Windows 电脑直接运行
+
+用于双机演示时，可以下载仓库中的
+[`releases/windows-server/remote-control-windows-server.zip`](releases/windows-server/remote-control-windows-server.zip)。
+解压后双击 `Start-Server.cmd`，不需要在被控端安装编译器。压缩包包含服务端程序及其 MinGW 运行库。
+
+首次启动出现 Windows 防火墙提示时，只允许“专用网络”。当前版本没有认证和加密，请仅在可信局域网中使用。
+
 ### Windows server → 任意 client
 
 Windows：
